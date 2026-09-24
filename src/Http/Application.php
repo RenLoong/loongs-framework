@@ -154,9 +154,13 @@ final class Application
         $app = $this;
         $container = $this->container;
 
-        $routesFile = $this->basePath . '/routes/web.php';
-        if (is_file($routesFile)) {
-            require $routesFile;
+        $routesDir = $this->basePath . '/routes';
+        if (is_dir($routesDir)) {
+            $files = glob($routesDir . '/*.php') ?: [];
+            sort($files, SORT_STRING);
+            foreach ($files as $routesFile) {
+                require $routesFile;
+            }
         }
 
         $discovery = new AppDiscovery($this->basePath . '/apps');
