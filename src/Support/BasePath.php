@@ -12,7 +12,7 @@ use Loongs\Http\Application;
  *
  * Priority:
  * 1. Booted Application ($GLOBALS['__loongs_app']) or an explicit set() pin
- * 2. Constant LOONGS_BASE_PATH, then env LOONGS_BASE_PATH
+ * 2. Constant LOONGS_BASE_PATH (defined by server/start), then env LOONGS_BASE_PATH (advanced override)
  * 3. Composer root package install_path (path-repo or Packagist vendor layouts)
  * 4. getcwd()
  */

@@ -439,7 +439,7 @@ final class ProcessManager
         }
 
         // Fallback when pcntl_signal is disabled: Swoole signal + brief event wait is not used
-        // in the poll loop; document running with `php -d disable_functions= bin/start`.
+        // in the poll loop; document running with `php -d disable_functions= start`.
         fwrite(STDERR, "Warning: pcntl_signal unavailable; run with php -d disable_functions= for stop/reload signals.\n");
         Process::signal(SIGTERM, $handleStop);
         Process::signal(SIGINT, $handleStop);
