@@ -1,0 +1,26 @@
+{
+    "name": "loongs/framework",
+    "description": "loong-swoole — lightweight Swoole HTTP framework",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": "^8.4",
+        "ext-swoole": "^6"
+    },
+    "suggest": {
+        "ext-pdo": "Required for Loongs\\Database PDO pools",
+        "ext-pdo_mysql": "MySQL driver for Loongs\\Database",
+        "ext-redis": "Required for Loongs\\Redis pools (phpredis)",
+        "loongs/cache": "Optional CacheManager (file/redis/memory/table) via class_exists integration"
+    },
+    "autoload": {
+        "psr-4": {
+            "Loongs\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
