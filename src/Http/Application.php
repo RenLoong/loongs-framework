@@ -23,6 +23,7 @@ use Loongs\Rpc\Contract\RpcRequest;
 use Loongs\Rpc\Contract\RpcResponse;
 use Loongs\Rpc\Discovery\ConfigServiceDiscovery;
 use Loongs\Rpc\Discovery\ServiceDiscoveryInterface;
+use Loongs\Rpc\HotReload\RpcServiceManager;
 use Loongs\Rpc\HotReload\RpcServiceReloader;
 use Loongs\Rpc\Registry\ServiceRegistry;
 use Loongs\Rpc\Retry\RetryPolicy;
@@ -198,7 +199,14 @@ final class Application
         // Hot switch: apply runtime overrides now; workers start a timer (WorkerPools).
         $reloader = RpcServiceReloader::fromConfig($this->config, $this->basePath, $discovery);
         $this->container->instance(RpcServiceReloader::class, $reloader);
+        // Shared across the workers of this role's server (created before it forks):
+        // RpcServiceManager writes bump it → siblings reload on their next call.
+        if (class_exists(\Swoole\Atomic::class)) {
+            $reloader->setPeerBus(new \Swoole\Atomic(0));
+        }
         $reloader->check(true);
+        // Code API for hot switch (same path as `start rpc:*`); also rpc_services().
+        $this->container->instance(RpcServiceManager::class, new RpcServiceManager($reloader));
 
         $serviceRegistry = new ServiceRegistry($discovery);
         $this->container->instance(ServiceRegistry::class, $serviceRegistry);

@@ -57,6 +57,34 @@ if (!function_exists('redis')) {
     }
 }
 
+if (!function_exists('rpc_services')) {
+    /**
+     * RPC hot-switch code API (same implementation as `start rpc:*`).
+     *
+     * rpc_services()->switch('user', 'remote', 'http://10.0.0.12:9502');
+     * rpc_services()->set('user', [...]); ->reset('user'); ->resetAll(); ->show(); ->reload();
+     *
+     * Booted app: the process's manager (applies in this process immediately, siblings of the
+     * same server on their next call, other processes within rpc.hot_reload.interval_ms).
+     * No app (plain script): standalone manager like the CLI.
+     */
+    function rpc_services(): \Loongs\Rpc\HotReload\RpcServiceManager
+    {
+        /** @var Application|null $application */
+        $application = $GLOBALS['__loongs_app'] ?? null;
+        if ($application instanceof Application && $application->container()->has(\Loongs\Rpc\HotReload\RpcServiceManager::class)) {
+            /** @var \Loongs\Rpc\HotReload\RpcServiceManager $manager */
+            $manager = $application->container()->make(\Loongs\Rpc\HotReload\RpcServiceManager::class);
+
+            return $manager;
+        }
+
+        static $standalone = null;
+
+        return $standalone ??= \Loongs\Rpc\HotReload\RpcServiceManager::fromBasePath();
+    }
+}
+
 if (!function_exists('queue')) {
     /**
      * Queue manager, or push a job when $job is a class-string.

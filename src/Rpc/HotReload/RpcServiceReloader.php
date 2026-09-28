@@ -24,6 +24,11 @@ use Throwable;
  * previous map stays active. RpcClient additionally calls maybeReload() (throttled by the
  * same interval) so processes without a timer (queue/crontab/custom/CLI) also converge.
  *
+ * Peer bus (optional Swoole\Atomic, created by Application before the role's server forks):
+ * RpcServiceManager bumps it after a write; every worker of the same server sees the new
+ * value on its next maybeReload() and re-checks immediately instead of waiting for the
+ * interval. Processes of other roles/nodes (and CLI writes) still converge via the timer.
+ *
  * Only rpc.services is hot-reloaded; retry/iouring/node still need a restart.
  */
 final class RpcServiceReloader
@@ -37,6 +42,11 @@ final class RpcServiceReloader
     private bool $checking = false;
 
     private ?int $timerId = null;
+
+    private ?\Swoole\Atomic $peerBus = null;
+
+    /** Peer-bus value this process has fully applied (updated after the check finishes). */
+    private int $seenPeerVersion = 0;
 
     /** @var array<string, string> service => config|override */
     private array $sources = [];
@@ -60,7 +70,10 @@ final class RpcServiceReloader
         };
     }
 
-    public static function fromConfig(Repository $config, string $basePath, ConfigServiceDiscovery $discovery): self
+    /**
+     * @param null|callable(string): void $logger
+     */
+    public static function fromConfig(Repository $config, string $basePath, ConfigServiceDiscovery $discovery, ?callable $logger = null): self
     {
         /** @var mixed $hot */
         $hot = $config->get('rpc.hot_reload', []);
@@ -75,6 +88,7 @@ final class RpcServiceReloader
             overrides: new RpcServiceOverrides(self::resolvePath($basePath, (string) ($hot['override_file'] ?? 'runtime/rpc_services.json'))),
             enabled: $enabled,
             intervalMs: max(50, $interval),
+            logger: $logger,
         );
     }
 
@@ -88,6 +102,36 @@ final class RpcServiceReloader
         }
 
         return rtrim($basePath, '/\\') . '/' . ltrim($path, '/\\');
+    }
+
+    /**
+     * Share a version counter between the workers of one Swoole server (create it before
+     * the server forks). null = disabled (interval-only convergence).
+     */
+    public function setPeerBus(?\Swoole\Atomic $bus): void
+    {
+        $this->peerBus = $bus;
+        $this->seenPeerVersion = $bus !== null ? $bus->get() : 0;
+    }
+
+    public function peerBus(): ?\Swoole\Atomic
+    {
+        return $this->peerBus;
+    }
+
+    /**
+     * Tell sibling workers that the sources changed (they re-check on their next call).
+     * Returns the new bus version, or null when no bus is attached.
+     */
+    public function notifyPeers(): ?int
+    {
+        if ($this->peerBus === null) {
+            return null;
+        }
+        $version = $this->peerBus->add(1);
+        $this->seenPeerVersion = $version; // this process already applied it (check(true) ran first)
+
+        return $version;
     }
 
     public function enabled(): bool
@@ -183,11 +227,25 @@ final class RpcServiceReloader
 
     /**
      * Reload when sources changed (or always when $force). Returns true when swapped.
+     *
+     * $wait: when another coroutine of this worker is mid-check, wait for it to finish and
+     * then check again (instead of returning immediately with the old map). Forced checks
+     * always wait.
      */
-    public function check(bool $force = false): bool
+    public function check(bool $force = false, bool $wait = false): bool
     {
         if ($this->checking) {
-            return false;
+            // A forced / peer-triggered check must not be lost because another coroutine
+            // (timer or a concurrent call) is mid-check: wait for it, then run our own.
+            if (!($force || $wait) || !self::inCoroutine()) {
+                return false;
+            }
+            for ($i = 0; $this->checking && $i < 2000; $i++) {
+                \Swoole\Coroutine::sleep(0.001);
+            }
+            if ($this->checking) {
+                return false;
+            }
         }
         $this->checking = true;
         $this->lastCheckAt = microtime(true);
@@ -241,12 +299,26 @@ final class RpcServiceReloader
     }
 
     /**
-     * Cheap call-path check, throttled to intervalMs (no-op when disabled).
+     * Cheap call-path check: immediate when the peer bus moved, otherwise throttled to
+     * intervalMs (no-op when disabled).
      */
     public function maybeReload(): void
     {
         if (!$this->enabled) {
             return;
+        }
+        if ($this->peerBus !== null) {
+            $target = $this->peerBus->get();
+            if ($target !== $this->seenPeerVersion) {
+                // Concurrent coroutines all block here until the swap is done, so no call
+                // after the bump can still resolve against the old map.
+                $this->check(false, true);
+                if ($target > $this->seenPeerVersion) {
+                    $this->seenPeerVersion = $target;
+                }
+
+                return;
+            }
         }
         if ((microtime(true) - $this->lastCheckAt) * 1000 < $this->intervalMs) {
             return;
@@ -303,6 +375,11 @@ final class RpcServiceReloader
         }
 
         return $parts === [] ? '(no services)' : implode(' ', $parts);
+    }
+
+    private static function inCoroutine(): bool
+    {
+        return class_exists(\Swoole\Coroutine::class) && \Swoole\Coroutine::getCid() > 0;
     }
 
     private function log(string $line): void

@@ -4,12 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Rpc\Console;
 
-use Loongs\Config\Repository;
-use Loongs\Rpc\Discovery\ConfigServiceDiscovery;
-use Loongs\Rpc\Discovery\ServiceInstance;
-use Loongs\Rpc\HotReload\RpcServiceReloader;
-use Loongs\Support\BasePath;
-use Loongs\Support\Env;
+use Loongs\Rpc\HotReload\RpcServiceManager;
 use Throwable;
 
 /**
@@ -20,15 +15,15 @@ use Throwable;
  *   rpc:set    <service> '<json service config>' (full config: instances, weights, metadata…)
  *   rpc:reset  <service>|--all                   drop runtime override(s) → back to config/rpc.php
  *
- * Writes go to rpc.hot_reload.override_file atomically; running workers pick the change
- * up within rpc.hot_reload.interval_ms. Every write is validated with the same strict
- * parser the workers use, so an invalid switch is refused before it reaches the file.
+ * Thin renderer over RpcServiceManager (the same code API apps call via rpc_services()),
+ * so validation + atomic override-file writes have exactly one code path. Running workers
+ * pick CLI writes up within rpc.hot_reload.interval_ms.
  */
 final class RpcServiceCommand
 {
     private readonly string $basePath;
 
-    private ?RpcServiceReloader $reloader = null;
+    private ?RpcServiceManager $manager = null;
 
     /** @var resource */
     private $out;
@@ -40,11 +35,12 @@ final class RpcServiceCommand
      * @param resource|null $out
      * @param resource|null $err
      */
-    public function __construct(string $basePath, $out = null, $err = null)
+    public function __construct(string $basePath, $out = null, $err = null, ?RpcServiceManager $manager = null)
     {
         $this->basePath = rtrim($basePath, '/\\');
         $this->out = $out ?? STDOUT;
         $this->err = $err ?? STDERR;
+        $this->manager = $manager;
     }
 
     public static function handles(string $command): bool
@@ -79,65 +75,37 @@ final class RpcServiceCommand
     private function show(array $args): int
     {
         $only = $args[0] ?? null;
-        $reloader = $this->reloader();
-        $overrides = $reloader->overrides();
+        $state = $this->manager()->show($only);
 
         $this->line(sprintf(
             'hot_reload: enabled=%s interval_ms=%d',
-            $reloader->enabled() ? 'true' : 'false',
-            $reloader->intervalMs(),
+            $state['hot_reload']['enabled'] ? 'true' : 'false',
+            $state['hot_reload']['interval_ms'],
         ));
-        $this->line('config_file: ' . $reloader->configFile());
+        $this->line('config_file: ' . $state['config_file']);
 
-        $overrideState = 'missing';
-        $overrideOk = true;
-        $overrideServices = [];
-        if ($overrides->exists()) {
-            try {
-                $overrideServices = $overrides->services();
-                $overrideState = sprintf('valid (%d service(s))', count($overrideServices));
-            } catch (Throwable $e) {
-                $overrideOk = false;
-                $overrideState = 'INVALID — workers keep their previous map: ' . $e->getMessage();
-            }
-        }
-        $this->line('override_file: ' . $overrides->path() . ' [' . $overrideState . ']');
-
-        $configServices = $reloader->configServices();
-        $services = $configServices;
-        $sources = array_fill_keys(array_map('strval', array_keys($configServices)), 'config');
-        foreach ($overrideServices as $name => $cfg) {
-            $services[$name] = $cfg;
-            $sources[$name] = 'override';
-        }
-
-        try {
-            $map = ConfigServiceDiscovery::parseServices($services, true);
-            $valid = true;
-        } catch (Throwable $e) {
-            $map = ConfigServiceDiscovery::parseServices($services, false);
-            $valid = false;
-            $this->line('effective: INVALID (workers would reject it): ' . $e->getMessage());
+        $o = $state['override_file'];
+        $overrideCount = count(array_filter($state['services'], static fn (array $s): bool => $s['source'] === 'override'));
+        $label = match ($o['state']) {
+            'valid' => $only === null ? sprintf('valid (%d service(s))', $overrideCount) : 'valid',
+            'invalid' => 'INVALID — workers keep their previous map: ' . $o['error'],
+            default => 'missing',
+        };
+        $this->line('override_file: ' . $o['path'] . ' [' . $label . ']');
+        if ($state['error'] !== null) {
+            $this->line('effective: INVALID (workers would reject it): ' . $state['error']);
         }
 
         $this->line('services:');
-        foreach ($map as $name => $instances) {
-            if ($only !== null && $only !== $name) {
-                continue;
-            }
-            $this->line(sprintf('  %s  source=%s', $name, $sources[$name] ?? 'config'));
-            $this->line('    config: ' . json_encode($services[$name], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-            foreach ($instances as $i => $instance) {
+        foreach ($state['services'] as $name => $svc) {
+            $this->line(sprintf('  %s  source=%s', $name, $svc['source']));
+            $this->line('    config: ' . json_encode($svc['config'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+            foreach ($svc['instances'] as $i => $instance) {
                 $this->line('    #' . $i . ' ' . $this->describeInstance($instance));
             }
         }
-        if ($only !== null && !isset($map[$only])) {
-            $this->error("Service [{$only}] is not defined.");
 
-            return 1;
-        }
-
-        return ($overrideOk && $valid) ? 0 : 1;
+        return $state['valid'] ? 0 : 1;
     }
 
     /** @param list<string> $args */
@@ -146,49 +114,8 @@ final class RpcServiceCommand
         if (count($args) < 2) {
             return $this->usage(1, 'rpc:switch needs <service> <local|loopback|remote> [endpoint]');
         }
-        [$service, $transport] = [$args[0], strtolower($args[1])];
-        $endpoint = isset($args[2]) && $args[2] !== '' ? $args[2] : null;
-
-        if (!in_array($transport, ['local', 'loopback', 'remote'], true)) {
-            $this->error("Unknown transport [{$transport}] (expected local|loopback|remote).");
-
-            return 1;
-        }
-
-        $reloader = $this->reloader();
-        $effective = $reloader->effective();
-        if (!array_key_exists($service, $effective['services'])) {
-            $this->error("Service [{$service}] is not defined in config/rpc.php or overrides (use rpc:set to add one).");
-
-            return 1;
-        }
-
-        /** @var mixed $current */
-        $current = $effective['services'][$service];
-        $current = is_array($current) ? $current : [];
-
-        $new = ['transport' => $transport];
-        foreach (['timeout_ms', 'metadata'] as $keep) {
-            if (array_key_exists($keep, $current)) {
-                $new[$keep] = $current[$keep];
-            }
-        }
-
-        if ($transport === 'loopback' && $endpoint === null) {
-            $endpoint = 'http://127.0.0.1:' . (int) Env::get('RPC_PORT', 9502);
-        }
-        if ($transport === 'remote' && $endpoint === null) {
-            $this->error('rpc:switch <service> remote requires an endpoint, e.g. http://10.0.0.12:9502');
-
-            return 1;
-        }
-        if ($transport !== 'local' && $endpoint !== null) {
-            $new['endpoint'] = $endpoint;
-        }
-
-        ConfigServiceDiscovery::parseServices([$service => $new], true);
-        $reloader->overrides()->set($service, $new);
-        $this->applied($service, $new);
+        $config = $this->manager()->switch($args[0], $args[1], $args[2] ?? null);
+        $this->applied($args[0], $config);
 
         return 0;
     }
@@ -199,25 +126,23 @@ final class RpcServiceCommand
         if (count($args) < 2) {
             return $this->usage(1, "rpc:set needs <service> '<json>'");
         }
-        $service = $args[0];
         try {
             /** @var mixed $decoded */
             $decoded = json_decode($args[1], true, 64, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
-            $this->error('Invalid JSON: ' . $e->getMessage());
+            $this->error('ERROR: Invalid JSON: ' . $e->getMessage());
 
             return 1;
         }
-        if (!is_array($decoded) || (array_is_list($decoded) && $decoded !== [])) {
-            $this->error('Service config must be a JSON object.');
+        if (!is_array($decoded)) {
+            $this->error('ERROR: Service config must be a JSON object.');
 
             return 1;
         }
 
         /** @var array<string, mixed> $decoded */
-        ConfigServiceDiscovery::parseServices([$service => $decoded], true);
-        $this->reloader()->overrides()->set($service, $decoded);
-        $this->applied($service, $decoded);
+        $config = $this->manager()->set($args[0], $decoded);
+        $this->applied($args[0], $config);
 
         return 0;
     }
@@ -230,16 +155,15 @@ final class RpcServiceCommand
             return $this->usage(1, 'rpc:reset needs <service> or --all');
         }
 
-        $overrides = $this->reloader()->overrides();
         if ($target === '--all') {
-            $overrides->resetAll();
+            $this->manager()->resetAll();
             $this->line('reset: all runtime overrides removed → config/rpc.php services');
             $this->hint();
 
             return 0;
         }
 
-        if ($overrides->reset($target)) {
+        if ($this->manager()->reset($target)) {
             $this->line("reset: [{$target}] → config/rpc.php");
             $this->hint();
         } else {
@@ -256,16 +180,16 @@ final class RpcServiceCommand
     {
         $this->line(sprintf(
             'override: [%s] = %s',
-            $service,
+            trim($service),
             json_encode($config, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         ));
-        $this->line('file: ' . $this->reloader()->overrides()->path());
+        $this->line('file: ' . $this->manager()->reloader()->overrides()->path());
         $this->hint();
     }
 
     private function hint(): void
     {
-        $reloader = $this->reloader();
+        $reloader = $this->manager()->reloader();
         if ($reloader->enabled()) {
             $this->line(sprintf('running workers apply it within ~%d ms (no restart).', $reloader->intervalMs()));
         } else {
@@ -273,28 +197,24 @@ final class RpcServiceCommand
         }
     }
 
-    private function describeInstance(ServiceInstance $i): string
+    /**
+     * @param array<string, mixed> $i
+     */
+    private function describeInstance(array $i): string
     {
         return sprintf(
             'transport=%s endpoint=%s weight=%d timeout_ms=%s%s',
-            $i->transport,
-            $i->endpoint ?? '-',
-            $i->weight,
-            $i->timeoutMs !== null ? (string) $i->timeoutMs : '-',
-            $i->metadata !== [] ? ' metadata=' . json_encode($i->metadata, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : '',
+            (string) $i['transport'],
+            $i['endpoint'] ?? '-',
+            (int) $i['weight'],
+            $i['timeout_ms'] !== null ? (string) $i['timeout_ms'] : '-',
+            $i['metadata'] !== [] ? ' metadata=' . json_encode($i['metadata'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : '',
         );
     }
 
-    private function reloader(): RpcServiceReloader
+    private function manager(): RpcServiceManager
     {
-        if ($this->reloader === null) {
-            BasePath::set($this->basePath);
-            Env::load($this->basePath . '/.env');
-            $config = new Repository($this->basePath . '/config');
-            $this->reloader = RpcServiceReloader::fromConfig($config, $this->basePath, new ConfigServiceDiscovery());
-        }
-
-        return $this->reloader;
+        return $this->manager ??= RpcServiceManager::fromBasePath($this->basePath);
     }
 
     private function usage(int $code, string $message = ''): int
