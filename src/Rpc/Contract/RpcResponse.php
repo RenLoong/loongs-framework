@@ -10,6 +10,10 @@ use InvalidArgumentException;
  * Synchronous JSON-RPC response envelope.
  *
  * {"code":0,"message":"ok","data":{},"id":"uuid"}
+ *
+ * Optional "meta" (only serialized when non-empty):
+ * - meta.served_by  stamped by RpcServer when rpc.node is set (node + pid)
+ * - meta.instance   stamped client-side by RpcClient (transport/endpoint/metadata used)
  */
 final readonly class RpcResponse
 {
@@ -18,6 +22,8 @@ final readonly class RpcResponse
         public string $message,
         public mixed $data = null,
         public ?string $id = null,
+        /** @var array<string, mixed> */
+        public array $meta = [],
     ) {
     }
 
@@ -49,6 +55,23 @@ final readonly class RpcResponse
             message: (string) ($data['message'] ?? 'unknown error'),
             data: $data['data'] ?? null,
             id: isset($data['id']) ? (string) $data['id'] : null,
+            meta: isset($data['meta']) && is_array($data['meta']) ? $data['meta'] : [],
+        );
+    }
+
+    /**
+     * Copy with meta merged (right-hand keys win).
+     *
+     * @param array<string, mixed> $meta
+     */
+    public function withMeta(array $meta): self
+    {
+        return new self(
+            code: $this->code,
+            message: $this->message,
+            data: $this->data,
+            id: $this->id,
+            meta: $meta + $this->meta,
         );
     }
 
@@ -58,16 +81,21 @@ final readonly class RpcResponse
     }
 
     /**
-     * @return array{code: int, message: string, data: mixed, id: string|null}
+     * @return array{code: int, message: string, data: mixed, id: string|null, meta?: array<string, mixed>}
      */
     public function toArray(): array
     {
-        return [
+        $out = [
             'code' => $this->code,
             'message' => $this->message,
             'data' => $this->data,
             'id' => $this->id,
         ];
+        if ($this->meta !== []) {
+            $out['meta'] = $this->meta;
+        }
+
+        return $out;
     }
 
     public function toJson(): string

@@ -7,6 +7,7 @@ namespace Loongs\Process;
 use Loongs\Container\Container;
 use Loongs\Database\DatabaseManager;
 use Loongs\Redis\RedisManager;
+use Loongs\Rpc\HotReload\RpcServiceReloader;
 use Swoole\Server;
 
 /**
@@ -19,9 +20,11 @@ final class WorkerPools
         $server->on('WorkerStart', static function (Server $server, int $workerId) use ($container): void {
             self::enableCoroutineHooks();
             self::boot($container);
+            self::startRpcHotReload($container);
         });
 
         $close = static function () use ($container): void {
+            self::stopRpcHotReload($container);
             self::close($container);
         };
 
@@ -67,6 +70,37 @@ final class WorkerPools
             $redis->bootPools();
         } catch (\Throwable) {
             // Redis may be optional for some roles.
+        }
+    }
+
+    /**
+     * Per-worker timer that hot-reloads rpc.services (see RpcServiceReloader).
+     */
+    public static function startRpcHotReload(Container $container): void
+    {
+        if (!$container->has(RpcServiceReloader::class)) {
+            return;
+        }
+        try {
+            /** @var RpcServiceReloader $reloader */
+            $reloader = $container->make(RpcServiceReloader::class);
+            $reloader->startTimer();
+        } catch (\Throwable) {
+            // hot reload is best-effort; never block worker start
+        }
+    }
+
+    public static function stopRpcHotReload(Container $container): void
+    {
+        if (!$container->has(RpcServiceReloader::class)) {
+            return;
+        }
+        try {
+            /** @var RpcServiceReloader $reloader */
+            $reloader = $container->make(RpcServiceReloader::class);
+            $reloader->stopTimer();
+        } catch (\Throwable) {
+            // ignore
         }
     }
 

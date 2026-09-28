@@ -23,6 +23,7 @@ use Loongs\Rpc\Contract\RpcRequest;
 use Loongs\Rpc\Contract\RpcResponse;
 use Loongs\Rpc\Discovery\ConfigServiceDiscovery;
 use Loongs\Rpc\Discovery\ServiceDiscoveryInterface;
+use Loongs\Rpc\HotReload\RpcServiceReloader;
 use Loongs\Rpc\Registry\ServiceRegistry;
 use Loongs\Rpc\Retry\RetryPolicy;
 use Loongs\Rpc\Server\HandlerRegistry;
@@ -194,10 +195,15 @@ final class Application
         $this->container->instance(ConfigServiceDiscovery::class, $discovery);
         $this->container->instance(ServiceDiscoveryInterface::class, $discovery);
 
+        // Hot switch: apply runtime overrides now; workers start a timer (WorkerPools).
+        $reloader = RpcServiceReloader::fromConfig($this->config, $this->basePath, $discovery);
+        $this->container->instance(RpcServiceReloader::class, $reloader);
+        $reloader->check(true);
+
         $serviceRegistry = new ServiceRegistry($discovery);
         $this->container->instance(ServiceRegistry::class, $serviceRegistry);
 
-        $rpcServer = new RpcServer($handlerRegistry);
+        $rpcServer = new RpcServer($handlerRegistry, (string) $this->config->get('rpc.node', ''));
         $this->container->instance(RpcServer::class, $rpcServer);
 
         $http = new HttpJsonTransporter();
@@ -219,7 +225,7 @@ final class Application
         $retryPolicy = RetryPolicy::fromConfig($retryConfig, $defaultTimeout > 0 ? $defaultTimeout : 3000);
         $this->container->instance(RetryPolicy::class, $retryPolicy);
 
-        $client = new RpcClient($discovery, $local, $loopback, $remote, $retryPolicy);
+        $client = new RpcClient($discovery, $local, $loopback, $remote, $retryPolicy, reloader: $reloader);
         $this->container->instance(RpcClient::class, $client);
         $this->container->instance(RpcClientInterface::class, $client);
 

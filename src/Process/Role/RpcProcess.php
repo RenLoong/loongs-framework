@@ -151,12 +151,15 @@ final class RpcProcess implements ProcessInterface
                 (new Response())->json(['status' => 'ok', 'role' => 'rpc'], 'ok', 0, 200)->send($res);
             });
 
+            WorkerPools::startRpcHotReload($container);
+
             $shuttingDown = false;
-            $shutdown = static function () use ($server, &$shuttingDown): void {
+            $shutdown = static function () use ($server, $container, &$shuttingDown): void {
                 if ($shuttingDown) {
                     return;
                 }
                 $shuttingDown = true;
+                WorkerPools::stopRpcHotReload($container);
                 try {
                     $server->shutdown();
                 } catch (Throwable) {

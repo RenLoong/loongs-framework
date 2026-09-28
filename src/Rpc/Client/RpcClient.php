@@ -10,6 +10,7 @@ use Loongs\Rpc\Discovery\ServiceDiscoveryInterface;
 use Loongs\Rpc\Discovery\ServiceInstance;
 use Loongs\Rpc\Discovery\WeightedInstancePicker;
 use Loongs\Rpc\Exception\RpcException;
+use Loongs\Rpc\HotReload\RpcServiceReloader;
 use Loongs\Rpc\Retry\RetryPolicy;
 use Loongs\Rpc\Support\Sleeper;
 use Loongs\Rpc\Transport\TransportInterface;
@@ -22,6 +23,11 @@ use Throwable;
  * equal positive weights keep config order; unequal weights get a weighted shuffle.
  * Failover walks that order; after a full pass (or when failover=false),
  * sleep backoff_ms * multiplier^(round-1) and retry until max_attempts sends.
+ *
+ * Hot switch: the instance list is resolved once per call() (value copy), so a
+ * discovery swap never affects an in-flight call. When a RpcServiceReloader is given,
+ * call() first runs its throttled maybeReload(). Returned responses carry
+ * meta.instance = {transport, endpoint, metadata} of the instance that answered.
  */
 final class RpcClient implements RpcClientInterface
 {
@@ -33,6 +39,7 @@ final class RpcClient implements RpcClientInterface
         private readonly RetryPolicy $retryPolicy = new RetryPolicy(),
         private readonly WeightedInstancePicker $picker = new WeightedInstancePicker(),
         private readonly Sleeper $sleeper = new Sleeper(),
+        private readonly ?RpcServiceReloader $reloader = null,
     ) {
     }
 
@@ -46,6 +53,7 @@ final class RpcClient implements RpcClientInterface
         array $payload = [],
         array $meta = [],
     ): RpcResponse {
+        $this->reloader?->maybeReload();
         $instances = $this->picker->order($this->discovery->resolve($service));
         $policy = $this->retryPolicy->withMeta($meta);
 
@@ -71,7 +79,13 @@ final class RpcClient implements RpcClientInterface
                 $response = $transport->send($request, $config);
 
                 if ($response->isOk() || !$policy->shouldRetryResponse($response)) {
-                    return $response;
+                    return $response->withMeta([
+                        'instance' => [
+                            'transport' => $instance->transport,
+                            'endpoint' => $instance->endpoint,
+                            'metadata' => $instance->metadata,
+                        ],
+                    ]);
                 }
 
                 // Business failure configured as retryable — treat like a soft failure.

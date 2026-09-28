@@ -9,14 +9,43 @@ use Loongs\Rpc\Contract\RpcResponse;
 use Loongs\Rpc\Exception\RpcException;
 use Throwable;
 
+/**
+ * Dispatches RpcRequest → HandlerRegistry.
+ *
+ * $node (config rpc.node / env RPC_NODE): when non-empty every response carries
+ * meta.served_by = {node, pid} so operators can see which instance served a call
+ * (useful to verify `start rpc:switch`). Empty (default) keeps the wire format unchanged.
+ */
 final class RpcServer
 {
     public function __construct(
         private readonly HandlerRegistry $handlers,
+        private readonly string $node = '',
     ) {
     }
 
+    public function node(): string
+    {
+        return $this->node;
+    }
+
     public function handle(RpcRequest $request): RpcResponse
+    {
+        return $this->stamp($this->dispatch($request));
+    }
+
+    private function stamp(RpcResponse $response): RpcResponse
+    {
+        if ($this->node === '') {
+            return $response;
+        }
+
+        return $response->withMeta([
+            'served_by' => ['node' => $this->node, 'pid' => (int) getmypid()],
+        ]);
+    }
+
+    private function dispatch(RpcRequest $request): RpcResponse
     {
         try {
             $handler = $this->handlers->resolve($request);
@@ -55,23 +84,23 @@ final class RpcServer
     public function handleJson(string $json): RpcResponse
     {
         if ($json === '') {
-            return RpcResponse::fail(400, 'Empty RPC body');
+            return $this->stamp(RpcResponse::fail(400, 'Empty RPC body'));
         }
 
         /** @var mixed $decoded */
         $decoded = json_decode($json, true);
         if (!is_array($decoded)) {
-            return RpcResponse::fail(400, 'Invalid JSON RPC body');
+            return $this->stamp(RpcResponse::fail(400, 'Invalid JSON RPC body'));
         }
 
         try {
             $request = RpcRequest::fromArray($decoded);
         } catch (Throwable $e) {
-            return RpcResponse::fail(
+            return $this->stamp(RpcResponse::fail(
                 400,
                 $e->getMessage() !== '' ? $e->getMessage() : 'Invalid RPC request',
                 id: isset($decoded['id']) ? (string) $decoded['id'] : null,
-            );
+            ));
         }
 
         return $this->handle($request);
