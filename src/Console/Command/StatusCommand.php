@@ -27,6 +27,9 @@ final class StatusCommand extends Command
         $io->title('Loongs status');
         if ($r['running']) {
             $io->writeln(sprintf('  master: <info>running</info>  pid=<comment>%d</comment>', $r['master_pid']));
+            foreach ($r['notes'] ?? [] as $note) {
+                $io->writeln('  <comment>note</comment>: ' . $note);
+            }
         } else {
             $io->writeln('  master: <fg=red;options=bold>stopped</>');
             if ($r['orphans'] !== []) {

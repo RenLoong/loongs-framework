@@ -33,6 +33,9 @@ final class ProcessManager
     /** Watchdog: how long an orphaned child (master gone) gets after SIGTERM before SIGKILL. */
     private const ORPHAN_GRACE = 15.0;
 
+    /** Master self-heal interval (pid file / lock file deleted or replaced while running). */
+    private const HEAL_INTERVAL = 1.0;
+
     private string $basePath;
 
     /** @var list<string>|null */
@@ -74,6 +77,11 @@ final class ProcessManager
     private $lockHandle = null;
 
     private bool $forced = false;
+
+    private float $nextHealAt = 0.0;
+
+    /** Self-heal could not re-lock a replaced lock file (someone else holds it); logged once. */
+    private bool $healConflictLogged = false;
 
     /** @param list<string>|null $only */
     public function __construct(string $basePath, ?array $only = null)
@@ -148,13 +156,33 @@ final class ProcessManager
         }
 
         $this->ensureRuntimeDir();
+        // A live master of this instance wins, even when its pid / lock file was deleted.
+        $running = $this->masterPid();
+        if ($running !== null) {
+            throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $running));
+        }
         // Lock before any fork / daemonize: two concurrent `start`s → exactly one wins.
         $this->acquireLock();
+        try {
+            // Re-check under the lock: if the lock file was deleted / replaced, the running instance
+            // holds the old (unlinked) inode and a fresh lock proves nothing.
+            $running = $this->masterPid();
+            if ($running !== null) {
+                throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $running));
+            }
+            $orphans = $this->describe($this->topLevel($this->titledHolders()));
+            if ($orphans !== []) {
+                throw new \RuntimeException($this->orphanMessage($orphans));
+            }
+        } catch (\RuntimeException $e) {
+            $this->releaseLock();
+            throw $e;
+        }
         $this->writePidFile((int) getmypid());
         try {
             $this->assertPortsFree();
         } catch (\RuntimeException $e) {
-            $this->unlinkPidFile();
+            $this->unlinkOwnPidFile();
             $this->releaseLock();
             throw $e;
         }
@@ -221,8 +249,8 @@ final class ProcessManager
         };
         $pid = $this->masterPid();
         if ($pid === null) {
-            $holders = $this->lockHolders() ?? [];
-            if ($holders === [] || !$this->lockHeld()) {
+            $holders = $this->instancePids();
+            if ($holders === []) {
                 $this->unlinkStalePidFile();
                 $progress('not_running', []);
 
@@ -238,7 +266,7 @@ final class ProcessManager
         $started = microtime(true);
         $deadline = $started + $timeout;
         while (microtime(true) < $deadline) {
-            if (!$this->pidAlive($pid) && !$this->lockHeld()) {
+            if (!$this->pidAlive($pid) && !$this->instanceBusy()) {
                 $this->unlinkStalePidFile();
                 $progress('stopped', ['pid' => $pid, 'seconds' => round(microtime(true) - $started, 2)]);
 
@@ -276,7 +304,7 @@ final class ProcessManager
 
             return 0;
         }
-        $left = $this->lockHolders() ?? [];
+        $left = $this->instancePids();
         foreach ($left as $p) {
             @posix_kill($p, SIGKILL);
         }
@@ -310,15 +338,25 @@ final class ProcessManager
     public function masterPid(): ?int
     {
         $pid = $this->readPid();
-        if ($pid === null || !$this->pidAlive($pid) || !$this->lockHeld()) {
-            return null;
-        }
         $holders = $this->lockHolders();
-        if ($holders !== null && !in_array($pid, $holders, true)) {
-            return null;
+        if ($holders === null) {
+            // No /proc (non-Linux): pid file + lock only.
+            return $pid !== null && $this->pidAlive($pid) && $this->lockHeld() ? $pid : null;
+        }
+        if ($pid !== null && in_array($pid, $holders, true) && ($this->lockHeld() || $this->isMasterProcess($pid))) {
+            return $pid;
+        }
+        // Fallback when the pid file is missing / wrong or the lock file was deleted / replaced:
+        // the process titled "loong-swoole: master" that has THIS instance's lock path open (the
+        // current file or the unlinked inode, "<path> (deleted)"). The lock path is per instance
+        // (derived from the pid file), so other instances on the host never match.
+        foreach ($holders as $h) {
+            if ($this->isMasterProcess($h)) {
+                return $h;
+            }
         }
 
-        return $pid;
+        return null;
     }
 
     /** Lock file guarding this instance: <pid file without .pid>.lock (never unlinked). */
@@ -336,11 +374,11 @@ final class ProcessManager
      */
     public function orphans(): array
     {
-        if ($this->masterPid() !== null || !$this->lockHeld()) {
+        if ($this->masterPid() !== null) {
             return [];
         }
 
-        return $this->describe($this->topLevel($this->lockHolders() ?? []));
+        return $this->describe($this->topLevel($this->instancePids()));
     }
 
     public function pidFile(): string
@@ -425,6 +463,7 @@ final class ProcessManager
             'running' => $masterPid !== null,
             'master_pid' => $masterPid,
             'orphans' => $orphans,
+            'notes' => $masterPid !== null ? $this->healthNotes($masterPid) : [],
             'pid_file' => $this->pidFilePath(),
             'log_file' => $this->logFile(),
             'daemonize' => $this->daemonize(),
@@ -737,6 +776,7 @@ final class ProcessManager
                 }
             }
 
+            $this->selfHeal();
             usleep(100_000);
         }
 
@@ -751,7 +791,7 @@ final class ProcessManager
             $this->killTree();
             $this->waitUnlocked(1.0, true);
         }
-        $this->unlinkPidFile();
+        $this->unlinkOwnPidFile();
         $this->releaseLock();
         $now = microtime(true);
         ProcessLog::info(sprintf(
@@ -1022,11 +1062,7 @@ final class ProcessManager
                     }
                 }
                 if ($orphans !== []) {
-                    throw new \RuntimeException(sprintf(
-                        'The master is gone but %d process(es) of the previous run are still alive (%s) and may hold the ports. Run ./loongs stop to clean them up.',
-                        count($orphans),
-                        implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $orphans)),
-                    ));
+                    throw new \RuntimeException($this->orphanMessage($orphans));
                 }
                 throw new \RuntimeException("Another start is in progress (lock {$file} is held). Retry, or check ./loongs status.");
             }
@@ -1043,8 +1079,12 @@ final class ProcessManager
     private function unlinkStalePidFile(): void
     {
         if (is_resource($this->lockHandle)) {
-            $this->unlinkPidFile();
+            $this->unlinkOwnPidFile();
 
+            return;
+        }
+        // Never while this instance still has processes (lock file may have been deleted under them).
+        if ($this->masterPid() !== null || $this->titledHolders() !== []) {
             return;
         }
         $file = $this->lockFile();
@@ -1062,6 +1102,174 @@ final class ProcessManager
             flock($fh, LOCK_UN);
         }
         fclose($fh);
+    }
+
+    /** Canonical lock path as shown by /proc/<pid>/fd links (works when the file itself is gone). */
+    private function lockTarget(): string
+    {
+        $file = $this->lockFile();
+        $dir = realpath(dirname($file)) ?: dirname($file);
+
+        return $dir . '/' . basename($file);
+    }
+
+    private function isMasterProcess(int $pid): bool
+    {
+        return $this->processTitle($pid) === self::TITLE_PREFIX . ': master';
+    }
+
+    /**
+     * Lock holders titled "loong-swoole: …" — this instance's processes, excluding transient CLI
+     * probes (status/start) that merely opened the file.
+     *
+     * @return list<int>
+     */
+    private function titledHolders(): array
+    {
+        return array_values(array_filter(
+            $this->lockHolders() ?? [],
+            fn (int $p): bool => str_starts_with($this->processTitle($p), self::TITLE_PREFIX . ':'),
+        ));
+    }
+
+    /**
+     * Processes of this instance: every lock holder while the lock is held, else only the titled
+     * holders of the (possibly unlinked) lock path.
+     *
+     * @return list<int>
+     */
+    private function instancePids(): array
+    {
+        return $this->lockHeld() ? ($this->lockHolders() ?? []) : $this->titledHolders();
+    }
+
+    /** True while any process of this instance is alive (lock held, or titled holders of an unlinked lock). */
+    private function instanceBusy(): bool
+    {
+        return $this->lockHeld() || $this->titledHolders() !== [];
+    }
+
+    /** @param list<array{pid: int, ppid: int, title: string}> $orphans */
+    private function orphanMessage(array $orphans): string
+    {
+        return sprintf(
+            'The master is gone but %d process(es) of the previous run are still alive (%s) and may hold the ports. Run ./loongs stop to clean them up.',
+            count($orphans),
+            implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $orphans)),
+        );
+    }
+
+    /** Unlink the pid file only when it names this process (never a file another start wrote). */
+    private function unlinkOwnPidFile(): void
+    {
+        if ($this->readPid() === (int) getmypid()) {
+            $this->unlinkPidFile();
+        }
+    }
+
+    /**
+     * Master only, from the supervise loop (every HEAL_INTERVAL): restore a deleted / overwritten
+     * pid file, and re-create + re-lock a deleted / replaced lock file. Processes forked earlier keep
+     * the old (unlinked) inode; lockHolders() matches "<path> (deleted)" so status/stop/start still
+     * see them. If someone else already holds a replacement lock, log an ERROR (once) and keep running.
+     */
+    private function selfHeal(): void
+    {
+        $now = microtime(true);
+        if ($this->stopping || $now < $this->nextHealAt) {
+            return;
+        }
+        $this->nextHealAt = $now + self::HEAL_INTERVAL;
+        $me = (int) getmypid();
+
+        $pidFile = $this->pidFilePath();
+        clearstatcache(true, $pidFile);
+        $current = $this->readPid();
+        if ($current !== $me) {
+            $was = is_file($pidFile) ? sprintf('overwritten (%s)', $current === null ? 'invalid content' : 'pid ' . $current) : 'missing';
+            $this->writePidFile($me);
+            ProcessLog::warn(sprintf('pid file %s was %s: rewritten with pid %d', $pidFile, $was, $me));
+        }
+
+        $lockFile = $this->lockFile();
+        clearstatcache(true, $lockFile);
+        $st = @stat($lockFile);
+        $fst = is_resource($this->lockHandle) ? @fstat($this->lockHandle) : false;
+        if ($st !== false && $fst !== false && $st['ino'] === $fst['ino'] && $st['dev'] === $fst['dev']) {
+            $this->healConflictLogged = false;
+
+            return;
+        }
+        $fh = @fopen($lockFile, 'c');
+        if (!is_resource($fh)) {
+            if (!$this->healConflictLogged) {
+                ProcessLog::error(sprintf('lock file %s is %s and cannot be re-created; still running', $lockFile, $st === false ? 'missing' : 'replaced'));
+                $this->healConflictLogged = true;
+            }
+
+            return;
+        }
+        if (!flock($fh, LOCK_EX | LOCK_NB)) {
+            fclose($fh);
+            if (!$this->healConflictLogged) {
+                $others = array_values(array_diff($this->lockHolders() ?? [], $this->descendants($me)));
+                ProcessLog::error(sprintf(
+                    'lock file %s was replaced and is locked by another process (%s); still running — check ./loongs status',
+                    $lockFile,
+                    $others === [] ? '?' : implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $this->describe($others))),
+                ));
+                $this->healConflictLogged = true;
+            }
+
+            return;
+        }
+        $old = $this->lockHandle;
+        $this->lockHandle = $fh;
+        // Children keep the old descriptor (shared open file description), so the old inode stays
+        // locked while they live; closing our copy changes nothing for them.
+        if (is_resource($old)) {
+            fclose($old);
+        }
+        $this->healConflictLogged = false;
+        ProcessLog::warn(sprintf(
+            'lock file %s was %s: re-created and locked (children keep the unlinked inode; status/stop still find them)',
+            $lockFile,
+            $st === false ? 'missing' : 'replaced',
+        ));
+    }
+
+    /**
+     * Status notes for a running master whose pid / lock file is gone or not its own (self-healing).
+     *
+     * @return list<string>
+     */
+    private function healthNotes(int $masterPid): array
+    {
+        $notes = [];
+        $pid = $this->readPid();
+        if ($pid !== $masterPid) {
+            $notes[] = $pid === null
+                ? sprintf('pid file missing or invalid — the master rewrites it within ~%ds', (int) ceil(self::HEAL_INTERVAL))
+                : sprintf('pid file names pid %d, not the master — the master rewrites it within ~%ds', $pid, (int) ceil(self::HEAL_INTERVAL));
+        }
+        $target = $this->lockTarget();
+        clearstatcache(true, $target);
+        if (!is_file($target)) {
+            $notes[] = sprintf('lock file missing — the master re-creates it within ~%ds', (int) ceil(self::HEAL_INTERVAL));
+        } else {
+            $holdsCurrent = false;
+            foreach (@scandir('/proc/' . $masterPid . '/fd') ?: [] as $fd) {
+                if ($fd !== '.' && $fd !== '..' && @readlink('/proc/' . $masterPid . '/fd/' . $fd) === $target) {
+                    $holdsCurrent = true;
+                    break;
+                }
+            }
+            if (!$holdsCurrent && is_dir('/proc/' . $masterPid . '/fd')) {
+                $notes[] = sprintf('lock file was replaced — the master re-locks it within ~%ds', (int) ceil(self::HEAL_INTERVAL));
+            }
+        }
+
+        return $notes;
     }
 
     private function releaseLock(): void
@@ -1098,7 +1306,7 @@ final class ProcessManager
     {
         $deadline = microtime(true) + $timeout;
         do {
-            $free = $exceptSelf ? ($this->lockHolders() ?? []) === [] : !$this->lockHeld();
+            $free = $exceptSelf ? ($this->lockHolders() ?? []) === [] : !$this->instanceBusy();
             if ($free) {
                 return true;
             }
@@ -1119,10 +1327,11 @@ final class ProcessManager
         if (!is_dir('/proc/self/fd')) {
             return null;
         }
-        $file = $this->lockFile();
-        $target = realpath($file) ?: $file;
+        $target = $this->lockTarget();
+        $deleted = $target . ' (deleted)';
 
-        return $this->pidsWithFd(static fn (string $link): bool => $link === $target);
+        // "<path> (deleted)": the lock file was unlinked while processes of this instance still hold it.
+        return $this->pidsWithFd(static fn (string $link): bool => $link === $target || $link === $deleted);
     }
 
     /**
