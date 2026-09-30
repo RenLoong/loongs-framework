@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Http\Application;
 use Loongs\Process\ProcessInterface;
 use Loongs\Process\Queue\JobInterface;
@@ -59,13 +60,7 @@ final class QueueProcess implements ProcessInterface
         $container->instance(QueueManager::class, new QueueManager($redis, $app->config()));
         $container->instance(RedisQueue::class, $queue);
 
-        echo sprintf(
-            "[%s] Queue process [%s] queues=%s connection=%s\n",
-            date('Y-m-d H:i:s'),
-            $name,
-            implode(',', $queues),
-            $connection,
-        );
+        ProcessLog::info(sprintf('Queue process [%s] starting queues=%s connection=%s', $name, implode(',', $queues), $connection));
 
         co_run(function () use ($queue, $queues, $timeout, $container): void {
             $i = 0;
@@ -75,7 +70,7 @@ final class QueueProcess implements ProcessInterface
                 try {
                     $payload = $queue->pop($q, $timeout);
                 } catch (Throwable $e) {
-                    fwrite(STDERR, sprintf("[queue] pop error: %s\n", $e->getMessage()));
+                    ProcessLog::warn(sprintf('queue pop error: %s', $e->getMessage()));
                     Coroutine::sleep(0.5);
                     continue;
                 }
@@ -118,10 +113,10 @@ final class QueueProcess implements ProcessInterface
         } catch (Throwable $e) {
             if ($attempts >= $maxAttempts) {
                 $queue->ackFailed($payload, $queueName, $e->getMessage());
-                fwrite(STDERR, sprintf("[queue] job %s failed permanently: %s\n", $payload['id'] ?? '?', $e->getMessage()));
+                ProcessLog::error(sprintf('queue job %s failed permanently: %s', $payload['id'] ?? '?', $e->getMessage()));
             } else {
                 $queue->release($payload, $queueName, min(30, $attempts));
-                fwrite(STDERR, sprintf("[queue] job %s retry %d: %s\n", $payload['id'] ?? '?', $attempts, $e->getMessage()));
+                ProcessLog::warn(sprintf('queue job %s retry %d: %s', $payload['id'] ?? '?', $attempts, $e->getMessage()));
             }
         }
     }

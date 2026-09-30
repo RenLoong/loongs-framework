@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Http\Application;
 use Loongs\Process\ProcessInterface;
 use Loongs\Process\Websocket\EchoHandler;
@@ -63,7 +64,7 @@ final class WebsocketProcess implements ProcessInterface
             $handler->onClose($server, $fd);
         });
 
-        echo sprintf("[%s] WebSocket process [%s] starting on %s:%d handler=%s\n", date('Y-m-d H:i:s'), $name, $host, $port, $handlerClass);
+        ProcessLog::info(sprintf('WebSocket server starting on %s:%d handler=%s', $host, $port, $handlerClass));
         $server->start();
     }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Http\Application;
 use Loongs\Process\ProcessInterface;
 use Loongs\Support\Env;
@@ -29,7 +30,7 @@ final class HttpProcess implements ProcessInterface
         $settings = is_array($config['settings'] ?? null) ? $config['settings'] : [];
 
         $server = $app->createServer($host, $port, $settings);
-        echo sprintf("[%s] HTTP process [%s] starting on %s:%d\n", date('Y-m-d H:i:s'), $name, $host, $port);
+        ProcessLog::info(sprintf('HTTP server starting Swoole\\Http\\Server on %s:%d workers=%d', $host, $port, (int) ($settings['worker_num'] ?? 1)));
         $server->start();
     }
 }

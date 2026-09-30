@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Http;
 
+use Loongs\Process\ProcessLog;
 use Loongs\App\AppConfig;
 use Loongs\App\AppDiscovery;
 use Loongs\App\AppMiddlewareResolver;
@@ -181,7 +182,8 @@ final class Application
         if (!is_array($iouringConfig)) {
             $iouringConfig = [];
         }
-        IoUringSupport::bootstrap($iouringConfig);
+        // Applies the io_uring settings in every process; only RpcProcess logs the decision.
+        IoUringSupport::bootstrap($iouringConfig, log: false);
 
         $handlerRegistry = new HandlerRegistry();
         $this->container->instance(HandlerRegistry::class, $handlerRegistry);
@@ -344,7 +346,7 @@ final class Application
         $server = $this->createServer();
         $host = (string) $this->config->get('process.processes.http.host', Env::get('HTTP_HOST', '0.0.0.0'));
         $port = (int) $this->config->get('process.processes.http.port', Env::get('HTTP_PORT', 9501));
-        echo sprintf("[%s] HTTP server starting on %s:%d\n", date('Y-m-d H:i:s'), $host, $port);
+        ProcessLog::info(sprintf('HTTP server starting on %s:%d', $host, $port));
         $server->start();
     }
 }

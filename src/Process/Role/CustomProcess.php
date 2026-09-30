@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Http\Application;
 use Loongs\Process\ProcessInterface;
 use Loongs\Process\WorkerPools;
@@ -41,7 +42,7 @@ final class CustomProcess implements ProcessInterface
             throw new RuntimeException("Custom process class [{$class}] must implement ProcessInterface.");
         }
 
-        echo sprintf("[%s] Custom process [%s] class=%s\n", date('Y-m-d H:i:s'), $name, $class);
+        ProcessLog::info(sprintf('Custom process [%s] starting class=%s', $name, $class));
         try {
             $instance->handle($name, $config);
         } finally {

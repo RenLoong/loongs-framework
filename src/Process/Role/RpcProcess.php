@@ -4,21 +4,24 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Container\Container;
 use Loongs\Http\Application;
 use Loongs\Http\Request;
 use Loongs\Http\Response;
 use Loongs\Process\ProcessInterface;
+use Loongs\Process\ProcessLog;
 use Loongs\Process\WorkerPools;
 use Loongs\Rpc\Server\RpcServer;
 use Loongs\Rpc\Support\IoUringSupport;
-use Loongs\Container\Container;
 use Loongs\Support\Env;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Http\Server as CoroutineHttpServer;
+use Swoole\Event;
 use Swoole\Http\Request as SwooleRequest;
 use Swoole\Http\Response as SwooleResponse;
 use Swoole\Http\Server as HttpServer;
 use Swoole\Process;
+use Swoole\Timer;
 use Throwable;
 
 /**
@@ -31,6 +34,9 @@ use Throwable;
  */
 final class RpcProcess implements ProcessInterface
 {
+    /** Upper bound for draining in-flight requests on SIGTERM (master SIGKILLs after 15s). */
+    private const MAX_DRAIN_SECONDS = 10;
+
     public function __construct(
         private readonly string $basePath,
     ) {
@@ -47,13 +53,14 @@ final class RpcProcess implements ProcessInterface
         if (!is_array($iouringConfig)) {
             $iouringConfig = [];
         }
-        $iouring = IoUringSupport::bootstrap($iouringConfig);
+        // Only the RPC role logs the io_uring decision (Application::bootRpc() stays quiet).
+        $iouring = IoUringSupport::bootstrap($iouringConfig, log: true);
         IoUringSupport::applyFileTunables($iouringConfig);
 
         $host = (string) ($config['host'] ?? Env::get('RPC_HOST', '0.0.0.0'));
         $port = (int) ($config['port'] ?? Env::get('RPC_PORT', 9502));
         /** @var array<string, mixed> $settings */
-        $settings = is_array($config['settings'] ?? $config['settings'] ?? null) ? ($config['settings'] ?? $config['settings']) : [
+        $settings = is_array($config['settings'] ?? null) ? $config['settings'] : [
             'worker_num' => 1,
             'reload_async' => true,
             'max_wait_time' => 60,
@@ -67,9 +74,9 @@ final class RpcProcess implements ProcessInterface
         }
 
         if (IoUringSupport::usesNetworkUring($iouring)) {
-            $this->runUringServer($name, $host, $port, $path, $settings, $container);
+            $this->runUringServer($host, $port, $path, $settings, $container);
         } else {
-            $this->runEpollServer($name, $host, $port, $path, $settings, $container);
+            $this->runEpollServer($host, $port, $path, $settings, $container);
         }
     }
 
@@ -77,7 +84,6 @@ final class RpcProcess implements ProcessInterface
      * @param array<string, mixed> $settings
      */
     private function runUringServer(
-        string $name,
         string $host,
         int $port,
         string $path,
@@ -86,15 +92,13 @@ final class RpcProcess implements ProcessInterface
     ): void {
         $workerNum = max(1, (int) ($settings['worker_num'] ?? 1));
 
-        echo sprintf(
-            "[%s] RPC process [%s] starting Coroutine\\Http\\Server network=uring_socket on %s:%d path=%s workers=%d\n",
-            date('Y-m-d H:i:s'),
-            $name,
+        ProcessLog::info(sprintf(
+            'RPC server starting Coroutine\\Http\\Server network=uring_socket on %s:%d path=%s workers=%d',
             $host,
             $port,
             $path,
             $workerNum,
-        );
+        ));
 
         if ($workerNum === 1) {
             $this->serveUringWorker($host, $port, $path, $settings, $container);
@@ -103,14 +107,11 @@ final class RpcProcess implements ProcessInterface
         }
 
         // Multiple workers: SO_REUSEPORT via Coroutine\Http\Server 4th ctor arg.
+        $parentTag = ProcessLog::tag();
         $pool = new \Swoole\Process\Pool($workerNum);
-        $pool->on('WorkerStart', function (\Swoole\Process\Pool $pool, int $workerId) use ($host, $port, $path, $settings, $container): void {
-            echo sprintf(
-                "[%s] RPC uring worker#%d pid=%d\n",
-                date('Y-m-d H:i:s'),
-                $workerId,
-                getmypid(),
-            );
+        $pool->on('WorkerStart', function (\Swoole\Process\Pool $pool, int $workerId) use ($parentTag, $host, $port, $path, $settings, $container): void {
+            ProcessLog::setTag($parentTag . '/w' . $workerId);
+            ProcessLog::info(sprintf('RPC uring worker#%d pid=%d', $workerId, getmypid()));
             $this->serveUringWorker($host, $port, $path, $settings, $container);
         });
         $pool->start();
@@ -130,45 +131,90 @@ final class RpcProcess implements ProcessInterface
         WorkerPools::boot($container);
 
         $packageMax = (int) ($settings['package_max_length'] ?? (2 * 1024 * 1024));
+        $maxDrain = max(1, min(self::MAX_DRAIN_SECONDS, (int) ($settings['max_wait_time'] ?? self::MAX_DRAIN_SECONDS)));
 
-        Coroutine\run(function () use ($host, $port, $path, $packageMax, $container): void {
+        Coroutine\run(function () use ($host, $port, $path, $packageMax, $maxDrain, $container): void {
             $server = new CoroutineHttpServer($host, $port, false, true);
             if ($packageMax > 0 && method_exists($server, 'set')) {
                 /** @psalm-suppress InvalidArgument */
                 $server->set(['package_max_length' => $packageMax]);
             }
 
-            $handler = $this->makeRequestHandler($container, $path);
+            $inflight = 0;
+            $rpcHandler = $this->makeRequestHandler($container, $path);
+            $handler = static function (SwooleRequest $req, SwooleResponse $res) use ($rpcHandler, &$inflight): void {
+                ++$inflight;
+                try {
+                    $rpcHandler($req, $res);
+                } finally {
+                    --$inflight;
+                }
+            };
+            $health = static function (SwooleRequest $req, SwooleResponse $res): void {
+                (new Response())->json(['status' => 'ok', 'role' => 'rpc'], 'ok', 0, 200)->send($res);
+            };
 
             $server->handle($path, $handler);
             if ($path !== '/rpc') {
                 $server->handle('/rpc', $handler);
             }
-            $server->handle('/health', static function (SwooleRequest $req, SwooleResponse $res): void {
-                (new Response())->json(['status' => 'ok', 'role' => 'rpc'], 'ok', 0, 200)->send($res);
-            });
-            $server->handle('/rpc/health', static function (SwooleRequest $req, SwooleResponse $res): void {
-                (new Response())->json(['status' => 'ok', 'role' => 'rpc'], 'ok', 0, 200)->send($res);
-            });
+            $server->handle('/health', $health);
+            $server->handle('/rpc/health', $health);
 
             WorkerPools::startRpcHotReload($container);
 
-            $shuttingDown = false;
-            $shutdown = static function () use ($server, $container, &$shuttingDown): void {
-                if ($shuttingDown) {
+            /*
+             * Graceful stop WITHOUT Coroutine\Http\Server::shutdown().
+             *
+             * Swoole 6.2.2 + --enable-uring-socket bug: shutdown() → Socket::cancel(SW_EVENT_READ)
+             * resumes the accept coroutine directly (UringSocket does not override cancel(), so the
+             * pending io_uring ACCEPT is neither cancelled nor completed). Iouring::accept() then
+             * returns the event's initial result 0, uring_accept() wraps fd 0 (stdin) as a client
+             * socket, `new UringSocket(conn)` sets TCP_NODELAY on it →
+             *   WARNING Socket::set_option(): setsockopt(0, 6, 1, 4) failed ... non-socket[88]
+             * and a bogus onAccept coroutine runs on fd 0 while the ACCEPT SQE stays orphaned.
+             * (swoole-src v6.2.2: ext-src/swoole_http_server_coro.cc shutdown/start,
+             *  src/network/socket.cc Socket::cancel, src/coroutine/uring_socket.cc accept,
+             *  src/coroutine/iouring.cc accept/yield.)
+             *
+             * Instead: stop timers, drain in-flight requests (bounded), then stop the reactor with
+             * Event::exit() so Coroutine\run() returns; the accept coroutine is never resumed and the
+             * ring is torn down with the process. Deadlock check is disabled for that last step
+             * because the (intentionally) suspended accept coroutine would otherwise be reported.
+             */
+            $stopping = false;
+            $stop = static function (int $signo) use ($container, $maxDrain, &$inflight, &$stopping): void {
+                if ($stopping) {
                     return;
                 }
-                $shuttingDown = true;
+                $stopping = true;
+                $t0 = microtime(true);
                 WorkerPools::stopRpcHotReload($container);
-                try {
-                    $server->shutdown();
-                } catch (Throwable) {
-                    // ignore
+
+                $pending = $inflight;
+                if ($pending > 0) {
+                    ProcessLog::info(sprintf('RPC stopping (%s): draining %d in-flight request(s), max %ds', self::signalName($signo), $pending, $maxDrain));
                 }
+                $deadline = $t0 + $maxDrain;
+                while ($inflight > 0 && microtime(true) < $deadline) {
+                    Coroutine::sleep(0.02);
+                }
+                if ($inflight > 0) {
+                    ProcessLog::warn(sprintf('RPC drain timeout: %d request(s) still running, exiting anyway', $inflight));
+                }
+                ProcessLog::info(sprintf('RPC stopped (%s) in-flight=%d drained in %s', self::signalName($signo), $pending, ProcessLog::duration(microtime(true) - $t0)));
+
+                Coroutine::set(['enable_deadlock_check' => false]);
+                Timer::clearAll();
+                Event::exit();
             };
 
-            Process::signal(SIGTERM, $shutdown);
-            Process::signal(SIGINT, $shutdown);
+            // Only the master's SIGTERM stops us. SIGINT (Ctrl+C hits the whole process group) is
+            // swallowed: reacting to it would exit the reactor early and the master's SIGTERM that
+            // follows would then kill the process by signal instead of a clean exit code 0.
+            Process::signal(SIGTERM, $stop);
+            Process::signal(SIGINT, static function (): void {
+            });
 
             $server->start();
         });
@@ -176,11 +222,19 @@ final class RpcProcess implements ProcessInterface
         WorkerPools::close($container);
     }
 
+    private static function signalName(int $signo): string
+    {
+        return match ($signo) {
+            SIGTERM => 'SIGTERM',
+            SIGINT => 'SIGINT',
+            default => 'signal ' . $signo,
+        };
+    }
+
     /**
      * @param array<string, mixed> $settings
      */
     private function runEpollServer(
-        string $name,
         string $host,
         int $port,
         string $path,
@@ -196,14 +250,13 @@ final class RpcProcess implements ProcessInterface
 
         $server->on('request', $this->makeRequestHandler($container, $path));
 
-        echo sprintf(
-            "[%s] RPC process [%s] starting Swoole\\Http\\Server network=epoll on %s:%d path=%s\n",
-            date('Y-m-d H:i:s'),
-            $name,
+        ProcessLog::info(sprintf(
+            'RPC server starting Swoole\\Http\\Server network=epoll on %s:%d path=%s workers=%d',
             $host,
             $port,
             $path,
-        );
+            (int) ($settings['worker_num'] ?? 1),
+        ));
         $server->start();
     }
 

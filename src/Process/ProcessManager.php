@@ -50,6 +50,13 @@ final class ProcessManager
 
     private ?bool $daemonizeOverride = null;
 
+    private float $startedAt = 0.0;
+
+    private float $stopStartedAt = 0.0;
+
+    /** @var null|callable(list<array<string, mixed>>, float): void */
+    private $onStarted = null;
+
     /** @param list<string>|null $only */
     public function __construct(string $basePath, ?array $only = null)
     {
@@ -90,9 +97,29 @@ final class ProcessManager
         return $this->daemonizeOverride ?? !empty($this->masterOptions['daemonize']);
     }
 
+    /** Merged config repository (config/*.php), for banners / probes. Pre-fork safe. */
+    public function config(): Repository
+    {
+        return $this->config;
+    }
+
+    /**
+     * Called once in the master after every child was spawned and the listening ones accept
+     * connections (or failed / 5s passed). Rows: name, index, type, app, pid, listen, workers, state
+     * (listening | running | starting | exited), plus the elapsed seconds since start().
+     * In daemon mode it runs after daemonizing (stdout = process.log_file).
+     *
+     * @param callable(list<array<string, mixed>>, float): void $callback
+     */
+    public function onStarted(callable $callback): void
+    {
+        $this->onStarted = $callback;
+    }
+
     /**
      * Run the master in the foreground (or daemonized) until stopped. Returns the exit code.
-     * Log lines stay plain text (no ANSI) so they are safe for log files / daemon mode.
+     * Log lines go through ProcessLog (plain unless the caller enabled colours for a TTY).
+     * Daemon mode redirects stdin to /dev/null and stdout/stderr (master + children) to process.log_file.
      *
      * @throws \RuntimeException when already running or nothing is enabled (before forking)
      */
@@ -108,23 +135,38 @@ final class ProcessManager
         $this->ensureRuntimeDir();
         $this->running = true;
         $this->stopping = false;
+        $this->startedAt = microtime(true);
 
         if ($this->daemonize()) {
-            Process::daemon(true, true);
+            ProcessLog::setAnsi(false);
+            $this->daemonizeToLogFile();
         }
 
+        ProcessLog::setTag('master');
+        ProcessLog::setTagWidth($this->longestTag());
         $this->setTitle('master');
         $this->spawnAll();
         $this->writePidFile((int) getmypid());
+        $this->installSignals();
 
-        echo sprintf(
-            "[%s] ProcessManager started pid=%d children=%d\n",
-            date('Y-m-d H:i:s'),
+        $rows = $this->waitReady();
+        $notReady = array_values(array_filter($rows, static fn (array $r): bool => $r['state'] !== 'listening' && $r['state'] !== 'running'));
+        if ($this->onStarted !== null && !$this->stopping) {
+            ($this->onStarted)($rows, microtime(true) - $this->startedAt);
+        }
+        ProcessLog::info(sprintf(
+            'ProcessManager started pid=%d children=%d ready in %s',
             getmypid(),
             count($this->children),
-        );
+            ProcessLog::duration(microtime(true) - $this->startedAt),
+        ));
+        if ($notReady !== [] && !$this->stopping) {
+            ProcessLog::warn('not ready: ' . implode(', ', array_map(
+                static fn (array $r): string => sprintf('%s#%d %s', $r['name'], $r['index'], $r['state']),
+                $notReady,
+            )));
+        }
 
-        $this->installSignals();
         $this->supervise();
 
         return 0;
@@ -304,6 +346,140 @@ final class ProcessManager
         return $out;
     }
 
+    /**
+     * Poll until every child with a port accepts TCP connections and every other child
+     * survived its first 300ms (or died / $timeout passed / a stop signal arrived).
+     *
+     * @return list<array{name: string, index: int, type: string, app: string, pid: int, listen: ?string, workers: ?int, state: string}>
+     */
+    private function waitReady(float $timeout = 5.0): array
+    {
+        $deadline = microtime(true) + $timeout;
+        $states = [];
+        do {
+            if (function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+            }
+            if ($this->stopping) {
+                break;
+            }
+            $pending = false;
+            foreach ($this->children as $key => $child) {
+                if (isset($states[$key])) {
+                    continue;
+                }
+                if (!$this->childAlive($child['pid'])) {
+                    $states[$key] = 'exited';
+                    continue;
+                }
+                $port = (int) ($child['config']['port'] ?? 0);
+                if ($port > 0) {
+                    if ($this->portAccepting((string) ($child['config']['host'] ?? '0.0.0.0'), $port)) {
+                        $states[$key] = 'listening';
+                    } else {
+                        $pending = true;
+                    }
+                    continue;
+                }
+                if (microtime(true) - $child['started_at'] >= 0.3) {
+                    $states[$key] = 'running';
+                } else {
+                    $pending = true;
+                }
+            }
+            if (!$pending) {
+                break;
+            }
+            usleep(50_000);
+        } while (microtime(true) < $deadline);
+
+        $rows = [];
+        foreach ($this->children as $key => $child) {
+            $cfg = $child['config'];
+            $rows[] = [
+                'name' => $child['name'],
+                'index' => $child['index'],
+                'type' => $child['type'],
+                'app' => isset($cfg['_app']) ? (string) $cfg['_app'] : (isset($cfg['app']) ? (string) $cfg['app'] : '-'),
+                'pid' => $child['pid'],
+                'listen' => isset($cfg['port']) ? ((string) ($cfg['host'] ?? '0.0.0.0')) . ':' . (int) $cfg['port'] : null,
+                'workers' => isset($cfg['settings']['worker_num']) ? (int) $cfg['settings']['worker_num'] : null,
+                'state' => $states[$key] ?? 'starting',
+            ];
+        }
+
+        return $rows;
+    }
+
+    private function portAccepting(string $host, int $port): bool
+    {
+        $host = match ($host) {
+            '', '0.0.0.0' => '127.0.0.1',
+            '::', '[::]' => '[::1]',
+            default => str_contains($host, ':') && $host[0] !== '[' ? '[' . $host . ']' : $host,
+        };
+        $fp = @stream_socket_client('tcp://' . $host . ':' . $port, $errno, $errstr, 0.2);
+        if (!is_resource($fp)) {
+            return false;
+        }
+        fclose($fp);
+
+        return true;
+    }
+
+    /** Alive and not a zombie (children are only reaped in supervise()). */
+    private function childAlive(int $pid): bool
+    {
+        if (!$this->pidAlive($pid)) {
+            return false;
+        }
+        $stat = @file_get_contents('/proc/' . $pid . '/stat');
+        if (!is_string($stat) || ($rp = strrpos($stat, ')')) === false) {
+            return true;
+        }
+
+        return ($stat[$rp + 2] ?? '') !== 'Z';
+    }
+
+    /** Width of the longest log tag ("master", "<name>#<index>", "+/wN" for rpc pool workers). */
+    private function longestTag(): int
+    {
+        $width = strlen('master');
+        foreach ($this->enabledEntries() as $name => $cfg) {
+            $count = max(1, (int) ($cfg['count'] ?? 1));
+            $tag = $name . '#' . ($count - 1);
+            $workers = (int) ($cfg['settings']['worker_num'] ?? 1);
+            if ((string) ($cfg['type'] ?? $name) === 'rpc' && $workers > 1) {
+                $tag .= '/w' . ($workers - 1);
+            }
+            $width = max($width, strlen($tag));
+        }
+
+        return $width;
+    }
+
+    /**
+     * Daemonize with stdin → /dev/null and stdout/stderr → process.log_file (append), so every
+     * echo / ProcessLog line / PHP warning / Swoole log line of the master and its children lands there.
+     */
+    private function daemonizeToLogFile(): void
+    {
+        $file = $this->logFile();
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $log = @fopen($file, 'ab');
+        $null = @fopen('/dev/null', 'rb');
+        if (is_resource($log) && is_resource($null)) {
+            Process::daemon(true, true, [$null, $log, $log]);
+
+            return;
+        }
+        ProcessLog::warn('cannot open log file ' . $file . ' — daemon output discarded');
+        Process::daemon(true, false);
+    }
+
     private function spawnAll(): void
     {
         $entries = $this->enabledEntries();
@@ -330,12 +506,14 @@ final class ProcessManager
             try {
                 $manager->runChild($name, $index, $cfg, $type);
             } catch (Throwable $e) {
-                fwrite(STDERR, sprintf(
-                    "[%s] child %s#%d fatal: %s\n",
-                    date('Y-m-d H:i:s'),
+                ProcessLog::error(sprintf(
+                    'child %s#%d fatal: %s: %s (%s:%d)',
                     $name,
                     $index,
+                    $e::class,
                     $e->getMessage(),
+                    $e->getFile(),
+                    $e->getLine(),
                 ));
                 exit(1);
             }
@@ -343,7 +521,7 @@ final class ProcessManager
 
         $pid = $process->start();
         if ($pid <= 0) {
-            fwrite(STDERR, sprintf("Failed to fork process %s#%d\n", $name, $index));
+            ProcessLog::error(sprintf('failed to fork process %s#%d', $name, $index));
 
             return;
         }
@@ -360,14 +538,7 @@ final class ProcessManager
             'started_at' => microtime(true),
         ];
 
-        echo sprintf(
-            "[%s] spawned %s#%d type=%s pid=%d\n",
-            date('Y-m-d H:i:s'),
-            $name,
-            $index,
-            $type,
-            $pid,
-        );
+        ProcessLog::info(sprintf('spawned %s#%d type=%s pid=%d', $name, $index, $type, $pid));
     }
 
     /**
@@ -376,6 +547,16 @@ final class ProcessManager
     private function runChild(string $name, int $index, array $cfg, string $type): void
     {
         $this->setTitle($name . ($index > 0 ? '#' . $index : ''));
+        ProcessLog::setTag($name . '#' . $index);
+
+        // Children must not run the master's handlers (respawned children fork after installSignals()).
+        // SIGINT is ignored: on Ctrl+C the terminal signals the whole process group, but only the
+        // master reacts and stops children with SIGTERM (graceful, code=0 instead of signal=2).
+        if (function_exists('pcntl_signal')) {
+            pcntl_signal(SIGTERM, SIG_DFL);
+            pcntl_signal(SIGUSR1, SIG_DFL);
+            pcntl_signal(SIGINT, SIG_IGN);
+        }
 
         $processType = ProcessType::tryFromConfig($type);
         if ($processType === null) {
@@ -428,6 +609,7 @@ final class ProcessManager
                 if ($this->stopDeadline > 0 && microtime(true) >= $this->stopDeadline) {
                     foreach ($this->children as $k => $child) {
                         if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
+                            ProcessLog::warn(sprintf('stop timeout: SIGKILL %s#%d pid=%d', $child['name'], $child['index'], $child['pid']));
                             posix_kill($child['pid'], SIGKILL);
                         }
                         unset($this->children[$k]);
@@ -441,7 +623,12 @@ final class ProcessManager
 
         $this->running = false;
         $this->unlinkPidFile();
-        echo sprintf("[%s] ProcessManager exited\n", date('Y-m-d H:i:s'));
+        $now = microtime(true);
+        ProcessLog::info(sprintf(
+            'ProcessManager exited%s uptime=%s',
+            $this->stopStartedAt > 0 ? ' shutdown=' . ProcessLog::duration($now - $this->stopStartedAt) : '',
+            ProcessLog::duration($now - $this->startedAt),
+        ));
     }
 
     private function onChildExit(int $pid, int $code, int $signal): void
@@ -461,23 +648,28 @@ final class ProcessManager
         $child = $this->children[$key];
         unset($this->children[$key]);
 
-        echo sprintf(
-            "[%s] child exit %s#%d pid=%d code=%d signal=%d\n",
-            date('Y-m-d H:i:s'),
+        $now = microtime(true);
+        $line = sprintf(
+            'child exit %s#%d pid=%d code=%d signal=%d uptime=%s',
             $child['name'],
             $child['index'],
             $pid,
             $code,
             $signal,
+            ProcessLog::duration($child['started_at'] > 0 ? $now - $child['started_at'] : 0.0),
         );
 
         if ($this->stopping) {
+            $line .= ' stopped in ' . ProcessLog::duration($now - $this->stopStartedAt);
+            $code === 0 && $signal === 0 ? ProcessLog::info($line) : ProcessLog::warn($line);
+
             return;
         }
 
         // Backoff based on restart count.
         $restarts = (int) $child['restarts'] + 1;
         $backoffMs = min(10_000, 200 * (2 ** min($restarts, 5)));
+        ProcessLog::warn(sprintf('%s — restarting in %s (restart #%d)', $line, ProcessLog::duration($backoffMs / 1000), $restarts));
         usleep($backoffMs * 1000);
 
         $cfg = $child['config'];
@@ -497,7 +689,7 @@ final class ProcessManager
 
     private function reloadChildren(): void
     {
-        echo sprintf("[%s] reload: restarting children\n", date('Y-m-d H:i:s'));
+        ProcessLog::info(sprintf('reload: restarting %d children (SIGUSR1)', count($this->children)));
         foreach ($this->children as $child) {
             if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
                 // Prefer graceful: SIGUSR1 for Swoole servers, SIGTERM for others then respawn via wait.
@@ -508,12 +700,17 @@ final class ProcessManager
 
     private function installSignals(): void
     {
-        $handleStop = function () {
+        $handleStop = function (int $signo = SIGTERM) {
             if ($this->stopping) {
                 return;
             }
             $this->stopping = true;
-            echo sprintf("[%s] shutting down...\n", date('Y-m-d H:i:s'));
+            $this->stopStartedAt = microtime(true);
+            ProcessLog::info(sprintf(
+                'shutting down (%s): stopping %d children with SIGTERM',
+                $signo === SIGINT ? 'SIGINT' : ($signo === SIGTERM ? 'SIGTERM' : 'signal ' . $signo),
+                count($this->children),
+            ));
             foreach ($this->children as $child) {
                 if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
                     posix_kill($child['pid'], SIGTERM);
@@ -537,7 +734,7 @@ final class ProcessManager
 
         // Fallback when pcntl_signal is disabled: Swoole signal + brief event wait is not used
         // in the poll loop; document running with `php -d disable_functions= start`.
-        fwrite(STDERR, "Warning: pcntl_signal unavailable; run with php -d disable_functions= for stop/reload signals.\n");
+        ProcessLog::warn('pcntl_signal unavailable; run with php -d disable_functions= for stop/reload signals.');
         Process::signal(SIGTERM, $handleStop);
         Process::signal(SIGINT, $handleStop);
         Process::signal(SIGUSR1, function (): void {

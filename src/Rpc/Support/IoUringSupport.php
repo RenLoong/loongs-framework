@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Rpc\Support;
 
+use Loongs\Process\ProcessLog;
 /**
  * Detects / applies Swoole io_uring for the RPC stack.
  *
@@ -32,11 +33,13 @@ final class IoUringSupport
     /**
      * @param array<string, mixed> $config rpc.iouring config slice
      */
-    public static function bootstrap(array $config = []): IoUringStatus
+    public static function bootstrap(array $config = [], bool $log = true): IoUringStatus
     {
         $status = self::decide($config, apply: true);
         self::$last = $status;
-        self::logStatusOnce($status);
+        if ($log) {
+            self::logStatusOnce($status);
+        }
 
         return $status;
     }
@@ -130,7 +133,7 @@ final class IoUringSupport
             return;
         }
         self::$logged = true;
-        echo sprintf("[%s] %s\n", date('Y-m-d H:i:s'), $status->statusLine());
+        ProcessLog::info($status->statusLine());
     }
 
     /** @internal test helper */

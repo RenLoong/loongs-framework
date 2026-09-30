@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Rpc\HotReload;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Config\Repository;
 use Loongs\Rpc\Discovery\ConfigServiceDiscovery;
 use Loongs\Rpc\Discovery\ServiceInstance;
@@ -66,7 +67,8 @@ final class RpcServiceReloader
         ?callable $logger = null,
     ) {
         $this->logger = $logger ?? static function (string $line): void {
-            @fwrite(STDERR, sprintf("[%s] [rpc-hot] pid=%d %s\n", date('Y-m-d H:i:s'), getmypid(), $line));
+            $message = sprintf('[rpc-hot] pid=%d %s', getmypid(), $line);
+            str_contains($line, 'rejected') ? ProcessLog::warn($message) : ProcessLog::info($message);
         };
     }
 

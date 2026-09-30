@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Example;
 
+use Loongs\Process\ProcessLog;
 use Loongs\Process\ProcessInterface;
 use Loongs\Redis\RedisManager;
 use Swoole\Coroutine;
@@ -33,7 +34,7 @@ final class ExampleCustomProcess implements ProcessInterface
         $interval = max(1, (int) ($config['interval'] ?? 2));
         $key = (string) ($config['heartbeat_key'] ?? 'loong:process:custom:heartbeat');
 
-        echo sprintf("[%s] ExampleCustomProcess interval=%ds key=%s\n", date('Y-m-d H:i:s'), $interval, $key);
+        ProcessLog::info(sprintf('ExampleCustomProcess interval=%ds key=%s', $interval, $key));
 
         co_run(function () use ($interval, $key): void {
             while ($this->running) {
@@ -42,7 +43,7 @@ final class ExampleCustomProcess implements ProcessInterface
                     try {
                         $this->redis->setex($key, $interval * 5, $ts);
                     } catch (\Throwable $e) {
-                        fwrite(STDERR, "[custom] redis error: {$e->getMessage()}\n");
+                        ProcessLog::warn('custom redis error: ' . $e->getMessage());
                     }
                 }
                 Coroutine::sleep($interval);

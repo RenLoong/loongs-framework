@@ -74,6 +74,10 @@ final class Kernel extends SymfonyApplication
             if (class_exists(InstalledVersions::class) && InstalledVersions::isInstalled('loongs/framework')) {
                 $version = (string) InstalledVersions::getPrettyVersion('loongs/framework');
                 $ref = (string) InstalledVersions::getReference('loongs/framework');
+                if (str_starts_with($version, 'dev-')) {
+                    // Path / symlinked checkouts: the lock's reference goes stale, prefer the checkout HEAD.
+                    $ref = self::gitHead((string) InstalledVersions::getInstallPath('loongs/framework')) ?? $ref;
+                }
 
                 return $version . ($ref !== '' && str_starts_with($version, 'dev-') ? '@' . substr($ref, 0, 7) : '');
             }
@@ -81,6 +85,34 @@ final class Kernel extends SymfonyApplication
         }
 
         return 'dev';
+    }
+
+    /** Commit sha of a git checkout (HEAD → loose ref → packed-refs), or null. */
+    private static function gitHead(string $dir): ?string
+    {
+        $git = rtrim($dir, '/\\') . '/.git';
+        if ($dir === '' || !is_dir($git)) {
+            return null;
+        }
+        $head = trim((string) @file_get_contents($git . '/HEAD'));
+        if (preg_match('/^[0-9a-f]{40}$/', $head) === 1) {
+            return $head;
+        }
+        if (!str_starts_with($head, 'ref: ')) {
+            return null;
+        }
+        $ref = substr($head, 5);
+        $sha = trim((string) @file_get_contents($git . '/' . $ref));
+        if (preg_match('/^[0-9a-f]{40}$/', $sha) === 1) {
+            return $sha;
+        }
+        foreach (@file($git . '/packed-refs', FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+            if (str_ends_with($line, ' ' . $ref) && preg_match('/^[0-9a-f]{40}/', $line) === 1) {
+                return substr($line, 0, 40);
+            }
+        }
+
+        return null;
     }
 
     private function addLoongsCommand(SymfonyCommand $command): void

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Process\ProcessLog;
 use DateTimeImmutable;
 use Loongs\Http\Application;
 use Loongs\Process\Crontab\CronExpression;
@@ -59,7 +60,7 @@ final class CrontabProcess implements ProcessInterface
             try {
                 $expr = new CronExpression($rule);
             } catch (Throwable $e) {
-                fwrite(STDERR, sprintf("[crontab] skip task #%d: %s\n", $i, $e->getMessage()));
+                ProcessLog::warn(sprintf('crontab skip task #%d: %s', $i, $e->getMessage()));
                 continue;
             }
             $compiled[] = [
@@ -71,12 +72,7 @@ final class CrontabProcess implements ProcessInterface
             ];
         }
 
-        echo sprintf(
-            "[%s] Crontab process [%s] tasks=%d\n",
-            date('Y-m-d H:i:s'),
-            $name,
-            count($compiled),
-        );
+        ProcessLog::info(sprintf('Crontab process [%s] starting tasks=%d', $name, count($compiled)));
 
         co_run(function () use ($compiled, $container): void {
             $lastSecond = -1;
@@ -127,7 +123,7 @@ final class CrontabProcess implements ProcessInterface
                             }
                             $object->{$method}();
                         } catch (Throwable $e) {
-                            fwrite(STDERR, sprintf("[crontab] %s error: %s\n", $id, $e->getMessage()));
+                            ProcessLog::error(sprintf('crontab task %s error: %s', $id, $e->getMessage()));
                         } finally {
                             unset($this->runningTasks[$id]);
                         }
