@@ -17,10 +17,12 @@ use Swoole\Database\PDOProxy;
  * Pools must be created in WorkerStart (per worker process), never in the master
  * before Server::start(). Prefer run()/get+put so connections always return.
  *
- * Health: a broken PDO should not be put back if you know it is dead; call
- * put() only for reusable connections. Swoole's pool creates a new connection
- * when the channel is empty, so limited auto-heal exists, but poisoned conns
- * returned to the pool can fail until evicted by failed use + recreate.
+ * Health: put() only reusable connections. A connection that is lost / killed /
+ * in an unknown state goes to discard(): it is dropped and the pool opens a
+ * replacement (size stays constant). run() does this automatically: on an
+ * exception it rolls back an open transaction and discards lost connections.
+ * When every connection is busy, connection() waits pool.wait_timeout seconds
+ * (-1 = forever) and then throws PoolExhaustedException.
  */
 final class DatabaseManager
 {
@@ -98,9 +100,57 @@ final class DatabaseManager
     {
         $pool = $this->pool($name);
         $timeout = $this->waitTimeout($name);
-        /** @var PDO|PDOProxy $pdo */
         $pdo = $pool->get($timeout);
+        if (!is_object($pdo)) { // Channel::pop() timed out
+            throw new PoolExhaustedException(sprintf(
+                'Database pool [%s] exhausted: no connection freed within %ss (pool.size=%d).',
+                $name ?? $this->getDefaultConnection(),
+                $timeout,
+                $this->stats($name)['size'],
+            ));
+        }
+        /** @var PDO|PDOProxy $pdo */
         return $pdo;
+    }
+
+    /**
+     * Drop a broken connection instead of returning it; the pool opens a replacement
+     * (Swoole ConnectionPool::put(null): open count -1, then a new connection is made).
+     * If the replacement cannot connect right now, the next connection() retries.
+     */
+    public function discard(?object $pdo = null, ?string $name = null): void
+    {
+        $pool = $this->pool($name);
+        unset($pdo); // the caller's reference is the last one; the pool never sees it again
+        try {
+            $pool->put(null);
+        } catch (\Throwable) {
+            // replacement connect failed: open count is already decremented, get() will retry
+        }
+    }
+
+    /**
+     * @return array{size: int, open: int, idle: int, active: int}
+     */
+    public function stats(?string $name = null): array
+    {
+        $pool = $this->pool($name);
+        try {
+            $read = \Closure::bind(function (): array {
+                /** @var \Swoole\ConnectionPool $this */
+                return [
+                    'size' => (int) $this->size,
+                    'open' => (int) $this->num,
+                    'idle' => $this->pool instanceof \Swoole\Coroutine\Channel ? $this->pool->length() : 0,
+                ];
+            }, $pool, \Swoole\ConnectionPool::class);
+            $s = $read();
+        } catch (\Throwable) {
+            $s = ['size' => 0, 'open' => 0, 'idle' => 0];
+        }
+        $s['active'] = max(0, $s['open'] - $s['idle']);
+
+        return $s;
     }
 
     public function put(object $pdo, ?string $name = null): void
@@ -109,7 +159,8 @@ final class DatabaseManager
     }
 
     /**
-     * Borrow a connection, run $fn, always put back (even on throw).
+     * Borrow a connection, run $fn, always give it back (even on throw): an open
+     * transaction is rolled back; a lost / broken connection is discarded.
      *
      * @template T
      * @param callable(PDO|PDOProxy): T $fn
@@ -119,10 +170,47 @@ final class DatabaseManager
     {
         $pdo = $this->connection($name);
         try {
-            return $fn($pdo);
-        } finally {
-            $this->put($pdo, $name);
+            $result = $fn($pdo);
+        } catch (\Throwable $e) {
+            $this->giveBack($pdo, $name, self::isLostConnection($e));
+            throw $e;
         }
+        $this->giveBack($pdo, $name, false);
+
+        return $result;
+    }
+
+    /** True when $e says the connection itself is unusable (gone away, killed, lost, out of sync). */
+    public static function isLostConnection(\Throwable $e): bool
+    {
+        for ($x = $e; $x !== null; $x = $x->getPrevious()) {
+            $code = $x instanceof \PDOException && is_array($x->errorInfo ?? null) ? (int) ($x->errorInfo[1] ?? 0) : 0;
+            if (in_array($code, [1053, 1077, 1152, 1156, 1927, 2002, 2003, 2006, 2013, 2014, 2027, 2055, 4031], true)) {
+                return true;
+            }
+            foreach (['server has gone away', 'Lost connection', 'Connection was killed', 'Broken pipe', 'Error while sending',
+                'Packets out of order', 'Commands out of sync', 'disconnected by the server', 'Connection reset'] as $needle) {
+                if (stripos($x->getMessage(), $needle) !== false) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function giveBack(object $pdo, ?string $name, bool $broken): void
+    {
+        if (!$broken) {
+            try {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+            } catch (\Throwable) {
+                $broken = true;
+            }
+        }
+        $broken ? $this->discard($pdo, $name) : $this->put($pdo, $name);
     }
 
     /**
