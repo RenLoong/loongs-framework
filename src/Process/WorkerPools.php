@@ -24,17 +24,19 @@ final class WorkerPools
             self::startRpcHotReload($container);
         });
 
-        $close = static function () use ($container): void {
+        $close = static function (bool $loopRunning) use ($container): void {
             self::stopRpcHotReload($container);
-            self::close($container);
+            self::close($container, $loopRunning);
         };
 
+        // WorkerExit (reload_async) fires on every loop turn while the worker drains: the reactor
+        // is alive. WorkerStop runs after the reactor has ended.
         $server->on('WorkerStop', static function (Server $server, int $workerId) use ($close): void {
-            $close();
+            $close(false);
         });
 
         $server->on('WorkerExit', static function (Server $server, int $workerId) use ($close): void {
-            $close();
+            $close(true);
         });
     }
 
@@ -69,17 +71,17 @@ final class WorkerPools
             self::startRpcHotReload($container);
         });
 
-        $close = static function () use (&$app): void {
+        $close = static function (bool $loopRunning) use (&$app): void {
             if ($app instanceof Application) {
                 self::stopRpcHotReload($app->container());
-                self::close($app->container());
+                self::close($app->container(), $loopRunning);
             }
         };
         $server->on('WorkerStop', static function (Server $server, int $workerId) use ($close): void {
-            $close();
+            $close(false);
         });
         $server->on('WorkerExit', static function (Server $server, int $workerId) use ($close): void {
-            $close();
+            $close(true);
         });
 
         return static function () use (&$app): ?Application {
@@ -190,7 +192,91 @@ final class WorkerPools
         }
     }
 
-    public static function close(Container $container): void
+    /**
+     * Close this worker's DB / Redis pools. Swoole\ConnectionPool::close() closes a Channel and
+     * destroys hooked connections, which must happen inside a coroutine; WorkerStop / WorkerExit
+     * callbacks and the code after a role's co_run() are not coroutines (Coroutine::getCid() === -1),
+     * so closing there directly raised the uncatchable "API must be called in the coroutine" fatal
+     * on every `./loongs stop`.
+     *
+     * $loopRunning: the caller runs inside a live reactor (WorkerExit with reload_async). The close
+     * coroutine is then scheduled on that reactor (a nested Coroutine\run() would block it and
+     * starve the io_uring / socket completions the close waits for). Otherwise (WorkerStop, after
+     * co_run()) a short private Coroutine\run() is used. No-op when no pool is open.
+     */
+    public static function close(Container $container, bool $loopRunning = false): void
+    {
+        if (!self::hasOpenPools($container)) {
+            return; // never spawn coroutines for nothing: WorkerExit fires on every loop turn
+        }
+        self::inCoroutine(static function () use ($container): void {
+            self::closeNow($container);
+        }, $loopRunning);
+    }
+
+    /**
+     * Run $fn inside a coroutine (shutdown helper):
+     *   - already in a coroutine → call directly;
+     *   - $loopRunning → Coroutine::create(): runs synchronously up to its first yield, the live
+     *     reactor finishes it;
+     *   - otherwise → Swoole\Coroutine\run(). Timers / signal handlers a stopped worker left
+     *     behind would keep that loop alive, so it ends with Event::exit() once $fn returns, and a
+     *     watchdog ends it after $timeout seconds if $fn never completes.
+     * Without Swoole $fn is called directly. Errors are swallowed (shutdown path).
+     */
+    public static function inCoroutine(callable $fn, bool $loopRunning = false, float $timeout = 3.0): void
+    {
+        $task = static function () use ($fn): void {
+            try {
+                $fn();
+            } catch (\Throwable) {
+                // ignore close errors during shutdown
+            }
+        };
+        try {
+            if (!class_exists(\Swoole\Coroutine::class) || \Swoole\Coroutine::getCid() > 0) {
+                $task();
+
+                return;
+            }
+            if ($loopRunning) {
+                \Swoole\Coroutine::create($task);
+
+                return;
+            }
+            \Swoole\Coroutine\run(static function () use ($task, $timeout): void {
+                $watchdog = \Swoole\Timer::after(max(1, (int) ($timeout * 1000)), static function (): void {
+                    \Swoole\Event::exit();
+                });
+                $task();
+                \Swoole\Timer::clear($watchdog);
+                \Swoole\Event::exit();
+            });
+        } catch (\Throwable) {
+            // e.g. a reactor is unexpectedly still running: schedule on it instead
+            try {
+                \Swoole\Coroutine::create($task);
+            } catch (\Throwable) {
+            }
+        }
+    }
+
+    private static function hasOpenPools(Container $container): bool
+    {
+        foreach ([DatabaseManager::class, RedisManager::class] as $id) {
+            try {
+                if ($container->has($id) && $container->make($id)->isBooted()) {
+                    return true;
+                }
+            } catch (\Throwable) {
+                // not configured for this role
+            }
+        }
+
+        return false;
+    }
+
+    private static function closeNow(Container $container): void
     {
         try {
             /** @var DatabaseManager $db */

@@ -53,13 +53,19 @@ final class RedisManager
         $this->booted = true;
     }
 
+    /**
+     * Close every pool (must run inside a coroutine; WorkerPools::close() takes care of that).
+     * Pools are detached first, so a re-entrant call (WorkerExit fires repeatedly while a close
+     * coroutine is suspended) is a no-op instead of closing the same pool twice.
+     */
     public function closePools(): void
     {
-        foreach ($this->pools as $pool) {
-            $pool->close();
-        }
+        $pools = $this->pools;
         $this->pools = [];
         $this->booted = false;
+        foreach ($pools as $pool) {
+            $pool->close();
+        }
     }
 
     public function isBooted(): bool
