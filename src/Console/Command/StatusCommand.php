@@ -42,6 +42,25 @@ final class StatusCommand extends Command
                 $io->writeln('  → run <comment>./loongs stop</comment> to clean them up');
             }
         }
+        foreach ($r['foreign'] ?? [] as $f) {
+            if ($manager->isOwnProject($f['project'])) {
+                $io->writeln(sprintf(
+                    '  <fg=red;options=bold>conflict</>: another instance of this project with APP_NAME "%s" runs with a different pid file (pid %d %s%s) — APP_NAME must be unique on this host; start is refused until it stops or APP_NAME changes',
+                    $r['app_name'],
+                    $f['pid'],
+                    $f['title'],
+                    $f['lock'] !== null ? ', lock ' . $f['lock'] : '',
+                ));
+                continue;
+            }
+            $io->writeln(sprintf(
+                '  <fg=red;options=bold>conflict</>: another service with APP_NAME "%s" runs from %s (pid %d %s) — APP_NAME must be unique on this host; start is refused until it stops or APP_NAME changes',
+                $r['app_name'],
+                $f['project'],
+                $f['pid'],
+                $f['title'],
+            ));
+        }
         $io->writeln(sprintf('  pid file: %s', $r['pid_file']));
         if ($output->isVerbose()) {
             $io->writeln(sprintf('  log file: %s', $r['log_file']));

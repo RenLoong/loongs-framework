@@ -12,6 +12,7 @@ use Loongs\Process\Role\HttpProcess;
 use Loongs\Process\Role\QueueProcess;
 use Loongs\Process\Role\RpcProcess;
 use Loongs\Process\Role\WebsocketProcess;
+use Loongs\Rpc\Support\IoUringSupport;
 use Loongs\Support\BasePath;
 use Loongs\Support\Env;
 use Swoole\Process;
@@ -32,6 +33,12 @@ final class ProcessManager
 
     /** APP_NAME when unset or empty. */
     public const DEFAULT_APP_NAME = 'loongs';
+
+    /** Default pid / lock / log base name (framework name, independent of APP_NAME): runtime/loongs.pid|.lock|.log. */
+    public const DEFAULT_FILE_BASE = 'loongs';
+
+    /** Reload: how long a replacement child (rpc on uring_socket) may take to listen before the old one is kept. */
+    private const RELOAD_READY_TIMEOUT = 5.0;
 
     /** Graceful stop budget for children before the master SIGKILLs the whole tree. */
     private const STOP_GRACE = 15.0;
@@ -60,6 +67,14 @@ final class ProcessManager
     private bool $stopping = false;
 
     private bool $reloading = false;
+
+    /**
+     * Children replaced by a reload that are still draining (old rpc child after its replacement
+     * listens). Keyed by pid; reaped in onChildExit() without a respawn.
+     *
+     * @var array<int, array<string, mixed>>
+     */
+    private array $retiring = [];
 
     private float $stopDeadline = 0.0;
 
@@ -199,12 +214,14 @@ final class ProcessManager
             throw new \RuntimeException('No enabled processes to start (check config/process.php, .env and --only).');
         }
 
-        $this->ensureRuntimeDir();
         // A live master of this instance wins, even when its pid / lock file was deleted.
         $running = $this->masterPid();
         if ($running !== null) {
             throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $running));
         }
+        // Same APP_NAME running from another project / pid file: refuse before creating any file.
+        $this->assertNoForeignSameName();
+        $this->ensureRuntimeDir();
         // Lock before any fork / daemonize: two concurrent `start`s → exactly one wins.
         $this->acquireLock();
         try {
@@ -218,6 +235,8 @@ final class ProcessManager
             if ($orphans !== []) {
                 throw new \RuntimeException($this->orphanMessage($orphans));
             }
+            // Again under the lock (narrows the window of two projects starting at the same moment).
+            $this->assertNoForeignSameName();
         } catch (\RuntimeException $e) {
             $this->releaseLock();
             throw $e;
@@ -360,8 +379,8 @@ final class ProcessManager
     }
 
     /**
-     * Graceful reload (SIGUSR1 to the master → children reload). Returns the master pid,
-     * or null when not running.
+     * Graceful reload: SIGUSR1 to the master, which reloads every child per role (see
+     * reloadChildren()). Returns the master pid, or null when not running.
      */
     public function reload(): ?int
     {
@@ -434,7 +453,7 @@ final class ProcessManager
     {
         $rel = (string) ($this->masterOptions['log_file'] ?? '');
         if ($rel === '') {
-            $rel = 'runtime/' . $this->appName . '.log';
+            $rel = 'runtime/' . self::DEFAULT_FILE_BASE . '.log';
         }
         if ($rel !== '' && ($rel[0] === '/' || (strlen($rel) > 2 && $rel[1] === ':'))) {
             return $rel;
@@ -512,6 +531,7 @@ final class ProcessManager
             'running' => $masterPid !== null,
             'master_pid' => $masterPid,
             'orphans' => $orphans,
+            'foreign' => $this->foreignSameName(),
             'notes' => $masterPid !== null ? $this->healthNotes($masterPid) : [],
             'pid_file' => $this->pidFilePath(),
             'log_file' => $this->logFile(),
@@ -759,7 +779,9 @@ final class ProcessManager
         // master reacts and stops children with SIGTERM (graceful, code=0 instead of signal=2).
         if (function_exists('pcntl_signal')) {
             pcntl_signal(SIGTERM, SIG_DFL);
-            pcntl_signal(SIGUSR1, SIG_DFL);
+            // Reload is driven by the master (reloadChildren()). A stray SIGUSR1 must not kill a child
+            // (default action = terminate); Swoole\Server roles install their own SIGUSR1 handler.
+            pcntl_signal(SIGUSR1, SIG_IGN);
             pcntl_signal(SIGINT, SIG_IGN);
         }
         // Forked before the role binds any socket, so the watchdog never holds ports.
@@ -810,7 +832,7 @@ final class ProcessManager
             }
 
             if ($this->stopping) {
-                if ($this->children === []) {
+                if ($this->children === [] && $this->retiring === []) {
                     break;
                 }
                 if ($this->stopDeadline > 0 && microtime(true) >= $this->stopDeadline) {
@@ -853,6 +875,30 @@ final class ProcessManager
 
     private function onChildExit(int $pid, int $code, int $signal): void
     {
+        if (isset($this->retiring[$pid])) {
+            $old = $this->retiring[$pid];
+            unset($this->retiring[$pid]);
+            $now = microtime(true);
+            $line = sprintf(
+                'child exit %s#%d pid=%d code=%d signal=%d uptime=%s',
+                $old['name'],
+                $old['index'],
+                $pid,
+                $code,
+                $signal,
+                ProcessLog::duration($old['started_at'] > 0 ? $now - $old['started_at'] : 0.0),
+            );
+            if (!empty($old['failed'])) {
+                ProcessLog::warn($line . ' — discarded reload replacement');
+
+                return;
+            }
+            $line .= ' — replaced by reload' . ($old['retire_at'] > 0 ? ', drained in ' . ProcessLog::duration($now - $old['retire_at']) : '');
+            $code === 0 && $signal === 0 ? ProcessLog::info($line) : ProcessLog::warn($line);
+
+            return;
+        }
+
         $key = null;
         foreach ($this->children as $k => $child) {
             if ($child['pid'] === $pid) {
@@ -886,6 +932,31 @@ final class ProcessManager
             return;
         }
 
+        if (!empty($child['reload'])) {
+            // Stopped by reloadChildren() (SIGTERM): respawn at once, not counted as a crash.
+            $line .= ' — reload, stopped in ' . ProcessLog::duration($now - (float) $child['reload']);
+            if ($code === 0 && $signal === 0) {
+                ProcessLog::info($line . ' → respawning');
+            } elseif ($signal === SIGTERM) {
+                ProcessLog::info($line . ' (terminated by SIGTERM: the process has no SIGTERM handler) → respawning');
+            } else {
+                ProcessLog::warn($line . ' → respawning');
+            }
+            $this->children[$key] = [
+                'name' => $child['name'],
+                'index' => $child['index'],
+                'type' => $child['type'],
+                'config' => $child['config'],
+                'process' => null,
+                'pid' => 0,
+                'restarts' => (int) $child['restarts'],
+                'started_at' => 0.0,
+            ];
+            $this->spawnChild($child['name'], $child['index'], $child['config']);
+
+            return;
+        }
+
         // Backoff based on restart count.
         $restarts = (int) $child['restarts'] + 1;
         $backoffMs = min(10_000, 200 * (2 ** min($restarts, 5)));
@@ -907,15 +978,172 @@ final class ProcessManager
         $this->spawnChild($child['name'], $child['index'], $cfg);
     }
 
+    /**
+     * `./loongs reload` (SIGUSR1 to the master): reload every child gracefully, per role.
+     *
+     * - Swoole\Server roles (http, websocket, rpc on epoll): SIGUSR1 → Swoole reloads its workers
+     *   (reload_async: in-flight requests finish, the listening socket stays open). Every worker
+     *   builds a fresh Application in WorkerStart (WorkerPools::attachPerWorker()), so config/*.php,
+     *   routes and app code are re-read.
+     * - rpc on uring_socket (Coroutine\Http\Server, SO_REUSEPORT): a replacement child is spawned and
+     *   co-binds the port; once it listens, the old child gets SIGTERM, drains its in-flight requests
+     *   (bounded) and exits 0. Never Coroutine\Http\Server::shutdown() (uring fd 0 bug, RpcProcess).
+     * - queue / crontab / custom / app processes: SIGTERM (their loop exits), respawned at once.
+     *
+     * Children are fresh forks of the master, so they load the current code; only what the master
+     * itself loaded (.env, config/process.php, the process manager) needs `restart`.
+     */
     private function reloadChildren(): void
     {
-        ProcessLog::info(sprintf('reload: restarting %d children (SIGUSR1)', count($this->children)));
-        foreach ($this->children as $child) {
-            if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
-                // Prefer graceful: SIGUSR1 for Swoole servers, SIGTERM for others then respawn via wait.
-                posix_kill($child['pid'], SIGUSR1);
+        $t0 = microtime(true);
+        ProcessLog::info(sprintf('reload: %d children', count($this->children)));
+        $uring = null;
+        foreach (array_keys($this->children) as $key) {
+            if ($this->stopping) {
+                return;
+            }
+            $child = $this->children[$key] ?? null;
+            if ($child === null || $child['pid'] <= 0 || !$this->childAlive($child['pid'])) {
+                continue;
+            }
+            if (!empty($child['reload'])) {
+                continue; // a previous reload is still stopping it
+            }
+            $tag = $child['name'] . '#' . $child['index'];
+            switch ($this->reloadStrategy($child, $uring)) {
+                case 'signal':
+                    posix_kill($child['pid'], SIGUSR1);
+                    ProcessLog::info(sprintf('reload: %s pid=%d → SIGUSR1 (Swoole worker reload; listener stays open)', $tag, $child['pid']));
+                    break;
+                case 'overlap':
+                    $this->reloadByReplacement($key);
+                    break;
+                default:
+                    $this->children[$key]['reload'] = microtime(true);
+                    posix_kill($child['pid'], SIGTERM);
+                    ProcessLog::info(sprintf('reload: %s pid=%d → SIGTERM, respawned when it exits', $tag, $child['pid']));
             }
         }
+        ProcessLog::info(sprintf('reload: done in %s', ProcessLog::duration(microtime(true) - $t0)));
+    }
+
+    /**
+     * signal (Swoole\Server worker reload) | overlap (replacement child, then drain) | replace (SIGTERM + respawn).
+     * A Swoole server without a manager (mode forced to base with one worker) cannot reload its
+     * worker on SIGUSR1, so it is replaced like a plain process.
+     *
+     * @param array<string, mixed> $child
+     */
+    private function reloadStrategy(array $child, ?bool &$uring): string
+    {
+        $cfg = is_array($child['config'] ?? null) ? $child['config'] : [];
+        $settings = is_array($cfg['settings'] ?? null) ? $cfg['settings'] : [];
+        $type = ProcessType::tryFromConfig((string) $child['type']);
+        if ($type === ProcessType::Rpc && ($uring ??= $this->rpcUsesUring())) {
+            return 'overlap';
+        }
+
+        return match ($type) {
+            ProcessType::Http, ProcessType::Rpc => WorkerPools::reloadsWorkers($cfg, $settings) ? 'signal' : 'replace',
+            ProcessType::Websocket => WorkerPools::reloadsWorkers($cfg, $settings, true) ? 'signal' : 'replace',
+            default => 'replace',
+        };
+    }
+
+    /** Same decision the rpc child makes (IoUringSupport::probe() has no side effects). */
+    private function rpcUsesUring(): bool
+    {
+        try {
+            $cfg = $this->config->get('rpc.iouring', []);
+
+            return IoUringSupport::probe(is_array($cfg) ? $cfg : [])->networkActive;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * Spawn a replacement for $key next to the running child (both listen on the port via
+     * SO_REUSEPORT), wait until it listens, then SIGTERM the old one (it drains and exits 0).
+     * If the replacement does not come up, it is discarded and the old child keeps serving.
+     */
+    private function reloadByReplacement(string $key): void
+    {
+        $old = $this->children[$key];
+        $tag = $old['name'] . '#' . $old['index'];
+        $port = (int) ($old['config']['port'] ?? 0);
+        $this->retiring[$old['pid']] = $old + ['retire_at' => 0.0];
+        $this->spawnChild($old['name'], $old['index'], $old['config']);
+        $new = $this->children[$key];
+        if ($new['pid'] === $old['pid']) {
+            unset($this->retiring[$old['pid']]);
+            ProcessLog::error(sprintf('reload: %s could not fork a replacement; keeping pid=%d', $tag, $old['pid']));
+
+            return;
+        }
+        $deadline = microtime(true) + self::RELOAD_READY_TIMEOUT;
+        $ready = false;
+        while (microtime(true) < $deadline && !$this->stopping) {
+            if (function_exists('pcntl_signal_dispatch')) {
+                pcntl_signal_dispatch();
+            }
+            if (!$this->childAlive($new['pid'])) {
+                break;
+            }
+            if ($port <= 0 || !is_dir('/proc/self/fd')
+                ? microtime(true) - $new['started_at'] >= 0.5
+                : $this->treeListensOn($new['pid'], $port)) {
+                $ready = true;
+                break;
+            }
+            usleep(20_000);
+        }
+        if ($this->stopping) {
+            return; // handleStop() already sent SIGTERM to both
+        }
+        if (!$ready) {
+            if ($this->childAlive($new['pid'])) {
+                @posix_kill($new['pid'], SIGTERM);
+            }
+            unset($this->retiring[$old['pid']]);
+            $this->retiring[$new['pid']] = $new + ['retire_at' => microtime(true), 'failed' => true];
+            $this->children[$key] = $old;
+            ProcessLog::error(sprintf('reload: replacement %s pid=%d did not listen on :%d within %ds — keeping pid=%d', $tag, $new['pid'], $port, (int) self::RELOAD_READY_TIMEOUT, $old['pid']));
+
+            return;
+        }
+        $this->retiring[$old['pid']]['retire_at'] = microtime(true);
+        posix_kill($old['pid'], SIGTERM);
+        ProcessLog::info(sprintf(
+            'reload: %s new pid=%d listening on :%d after %s → SIGTERM old pid=%d (drains in-flight requests, then exits)',
+            $tag,
+            $new['pid'],
+            $port,
+            ProcessLog::duration(microtime(true) - $new['started_at']),
+            $old['pid'],
+        ));
+    }
+
+    /** True when $pid or one of its descendants has a LISTEN socket on $port open. */
+    private function treeListensOn(int $pid, int $port): bool
+    {
+        $inodes = $this->listenInodes($port);
+        if ($inodes === []) {
+            return false;
+        }
+        foreach (array_merge([$pid], $this->descendants($pid)) as $p) {
+            foreach (@scandir('/proc/' . $p . '/fd') ?: [] as $fd) {
+                if ($fd === '.' || $fd === '..') {
+                    continue;
+                }
+                $link = @readlink('/proc/' . $p . '/fd/' . $fd);
+                if (is_string($link) && isset($inodes[$link])) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private function installSignals(): void
@@ -936,6 +1164,11 @@ final class ProcessManager
             foreach ($this->children as $child) {
                 if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
                     posix_kill($child['pid'], SIGTERM);
+                }
+            }
+            foreach (array_keys($this->retiring) as $pid) {
+                if ($this->pidAlive($pid)) {
+                    posix_kill($pid, SIGTERM);
                 }
             }
             $this->stopDeadline = microtime(true) + self::STOP_GRACE;
@@ -1041,7 +1274,7 @@ final class ProcessManager
     {
         $rel = (string) ($this->masterOptions['pid_file'] ?? '');
         if ($rel === '') {
-            $rel = 'runtime/' . $this->appName . '.pid';
+            $rel = 'runtime/' . self::DEFAULT_FILE_BASE . '.pid';
         }
         if ($rel[0] === '/' || (strlen($rel) > 2 && $rel[1] === ':')) {
             return $rel;
@@ -1491,7 +1724,7 @@ final class ProcessManager
     /** SIGKILL every child and every other process holding the instance lock (grandchildren, watchdogs). */
     private function killTree(): void
     {
-        $pids = $this->lockHolders() ?? [];
+        $pids = array_merge($this->lockHolders() ?? [], array_keys($this->retiring));
         foreach ($this->children as $child) {
             if ($child['pid'] > 0) {
                 $pids[] = $child['pid'];
@@ -1506,7 +1739,7 @@ final class ProcessManager
     private function reapChildren(float $timeout): void
     {
         $deadline = microtime(true) + $timeout;
-        while ($this->children !== [] && microtime(true) < $deadline) {
+        while (($this->children !== [] || $this->retiring !== []) && microtime(true) < $deadline) {
             $ret = Process::wait(false);
             if (is_array($ret) && isset($ret['pid'])) {
                 $this->onChildExit((int) $ret['pid'], (int) ($ret['code'] ?? 0), (int) ($ret['signal'] ?? 0));
@@ -1515,6 +1748,7 @@ final class ProcessManager
             usleep(20_000);
         }
         $this->children = [];
+        $this->retiring = [];
     }
 
     /** Second SIGINT/SIGTERM while shutting down: SIGKILL the whole tree now. */
@@ -1524,7 +1758,7 @@ final class ProcessManager
             return;
         }
         $this->forced = true;
-        $pids = $this->lockHolders() ?? [];
+        $pids = array_merge($this->lockHolders() ?? [], array_keys($this->retiring));
         foreach ($this->children as $child) {
             if ($child['pid'] > 0) {
                 $pids[] = $child['pid'];
@@ -1605,6 +1839,22 @@ final class ProcessManager
      */
     private function portOwners(int $port): array
     {
+        $inodes = $this->listenInodes($port);
+        if ($inodes === []) {
+            return [];
+        }
+        $pids = $this->pidsWithFd(static fn (string $link): bool => isset($inodes[$link]));
+
+        return $this->topLevel($pids);
+    }
+
+    /**
+     * "socket:[inode]" links of the TCP LISTEN sockets on $port (/proc/net/tcp{,6}).
+     *
+     * @return array<string, true>
+     */
+    private function listenInodes(int $port): array
+    {
         $inodes = [];
         foreach (['/proc/net/tcp', '/proc/net/tcp6'] as $table) {
             foreach (@file($table, FILE_IGNORE_NEW_LINES) ?: [] as $i => $line) {
@@ -1618,12 +1868,126 @@ final class ProcessManager
                 }
             }
         }
-        if ($inodes === []) {
+
+        return $inodes;
+    }
+
+    /**
+     * Processes titled "loong-swoole[<APP_NAME>]: …" (same APP_NAME) that are NOT part of this
+     * instance — they do not hold this instance's lock path, i.e. another project directory or
+     * another pid file runs a service with the same name. Top-level processes only.
+     *
+     * @return list<array{pid: int, title: string, project: string, lock: ?string}>
+     */
+    public function foreignSameName(): array
+    {
+        if (!is_dir('/proc/self/fd')) {
             return [];
         }
-        $pids = $this->pidsWithFd(static fn (string $link): bool => isset($inodes[$link]));
+        $prefix = $this->titlePrefix . ': ';
+        $self = (int) getmypid();
+        $ours = array_flip($this->lockHolders() ?? []);
+        $foreign = [];
+        foreach (glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: [] as $dir) {
+            $pid = (int) basename($dir);
+            if ($pid === $self || isset($ours[$pid])) {
+                continue;
+            }
+            $cmd = @file_get_contents($dir . '/cmdline');
+            if (is_string($cmd) && str_starts_with($cmd, $prefix)) {
+                $foreign[] = $pid;
+            }
+        }
+        $out = [];
+        foreach ($this->topLevel($foreign) as $pid) {
+            $lock = $this->lockPathOf($pid);
+            $project = match (true) {
+                $lock === null => (string) (@readlink('/proc/' . $pid . '/cwd') ?: '?'),
+                basename(dirname($lock)) === 'runtime' => dirname($lock, 2),
+                default => dirname($lock),
+            };
+            $title = $this->processTitle($pid);
+            $out[] = [
+                'pid' => $pid,
+                'title' => strlen($title) > 60 ? substr($title, 0, 57) . '...' : $title,
+                'project' => $project,
+                'lock' => $lock,
+            ];
+        }
 
-        return $this->topLevel($pids);
+        return $out;
+    }
+
+    /**
+     * Refuse when a same-named service of another project runs (see foreignSameName()).
+     *
+     * @throws \RuntimeException
+     */
+    public function assertNoForeignSameName(): void
+    {
+        $foreign = $this->foreignSameName();
+        if ($foreign === []) {
+            return;
+        }
+        $list = implode(', ', array_map(static fn (array $o): string => sprintf(
+            'pid %d %s (project %s%s)',
+            $o['pid'],
+            $o['title'],
+            $o['project'],
+            $o['lock'] !== null ? ', lock ' . $o['lock'] : '',
+        ), $foreign));
+        if ($this->isOwnProject($foreign[0]['project'])) {
+            // Same project directory, other pid/lock file (PROCESS_PID_FILE differs): a second instance.
+            throw new \RuntimeException(sprintf(
+                'Another instance with APP_NAME "%s" is already running from this project with a different pid file: %s. APP_NAME must be unique on this host: give this instance its own APP_NAME in .env, or stop that instance first (kill -TERM %d, or ./loongs stop with its PROCESS_PID_FILE).',
+                $this->appName,
+                $list,
+                $foreign[0]['pid'],
+            ));
+        }
+        throw new \RuntimeException(sprintf(
+            'Another service with APP_NAME "%s" is already running from a different project: %s. APP_NAME must be unique on this host: change APP_NAME in %s/.env, or stop that service first (cd %s && ./loongs stop).',
+            $this->appName,
+            $list,
+            $this->basePath,
+            $foreign[0]['project'],
+        ));
+    }
+
+    /** True when $project (from foreignSameName) is this project's base directory. */
+    public function isOwnProject(?string $project): bool
+    {
+        if ($project === null || $project === '') {
+            return false;
+        }
+        $a = realpath($project) ?: rtrim($project, '/');
+        $b = realpath($this->basePath) ?: rtrim($this->basePath, '/');
+
+        return $a === $b;
+    }
+
+    /** Instance lock file a process holds (first "*.lock" fd, "(deleted)" stripped), or null. */
+    private function lockPathOf(int $pid): ?string
+    {
+        $found = null;
+        foreach (@scandir('/proc/' . $pid . '/fd') ?: [] as $fd) {
+            if ($fd === '.' || $fd === '..') {
+                continue;
+            }
+            $link = @readlink('/proc/' . $pid . '/fd/' . $fd);
+            if (!is_string($link)) {
+                continue;
+            }
+            $link = str_ends_with($link, ' (deleted)') ? substr($link, 0, -10) : $link;
+            if (str_ends_with($link, '.lock')) {
+                if (str_contains($link, '/runtime/')) {
+                    return $link;
+                }
+                $found ??= $link;
+            }
+        }
+
+        return $found;
     }
 
     /**

@@ -6,6 +6,7 @@ namespace Loongs\Process;
 
 use Loongs\Container\Container;
 use Loongs\Database\DatabaseManager;
+use Loongs\Http\Application;
 use Loongs\Redis\RedisManager;
 use Loongs\Rpc\HotReload\RpcServiceReloader;
 use Swoole\Server;
@@ -35,6 +36,91 @@ final class WorkerPools
         $server->on('WorkerExit', static function (Server $server, int $workerId) use ($close): void {
             $close();
         });
+    }
+
+    /**
+     * Build a fresh Application in every worker (WorkerStart) instead of once before the server
+     * forks, so a Swoole worker reload (`./loongs reload` → SIGUSR1) re-reads config/*.php, routes
+     * and app code. Pools and the rpc.services hot-reload timer follow the worker lifecycle as in
+     * attach(). The rpc hot-reload peer bus (Swoole\Atomic) is created here, before the fork, and
+     * shared by all workers of this server. Returns a getter for the current worker's Application.
+     *
+     * @param callable(): Application $factory
+     * @return \Closure(): ?Application
+     */
+    public static function attachPerWorker(Server $server, callable $factory): \Closure
+    {
+        $peerBus = class_exists(\Swoole\Atomic::class) ? new \Swoole\Atomic(0) : null;
+        $app = null;
+        $server->on('WorkerStart', static function (Server $server, int $workerId) use ($factory, $peerBus, &$app): void {
+            self::enableCoroutineHooks();
+            $app = $factory();
+            $container = $app->container();
+            if ($peerBus !== null) {
+                try {
+                    /** @var RpcServiceReloader $reloader */
+                    $reloader = $container->make(RpcServiceReloader::class);
+                    $reloader->setPeerBus($peerBus);
+                } catch (\Throwable) {
+                    // no rpc in this app
+                }
+            }
+            self::boot($container);
+            self::startRpcHotReload($container);
+        });
+
+        $close = static function () use (&$app): void {
+            if ($app instanceof Application) {
+                self::stopRpcHotReload($app->container());
+                self::close($app->container());
+            }
+        };
+        $server->on('WorkerStop', static function (Server $server, int $workerId) use ($close): void {
+            $close();
+        });
+        $server->on('WorkerExit', static function (Server $server, int $workerId) use ($close): void {
+            $close();
+        });
+
+        return static function () use (&$app): ?Application {
+            return $app;
+        };
+    }
+
+    /**
+     * Swoole server mode for a Swoole\Server role, chosen so that `./loongs reload` (SIGUSR1 → worker
+     * reload) always has a manager process to act on:
+     *   - process entry 'mode' => 'process' | 'base' wins;
+     *   - websocket ($preferProcess): SWOOLE_PROCESS — connections live in the master's reactor and
+     *     survive a worker reload;
+     *   - worker_num <= 1: SWOOLE_PROCESS (SWOOLE_BASE with one worker has no manager, SIGUSR1 is a no-op);
+     *   - otherwise SWOOLE_BASE (Swoole 6 default).
+     *
+     * @param array<string, mixed> $config   process entry (config/process.php)
+     * @param array<string, mixed> $settings Swoole settings of that entry
+     */
+    public static function serverMode(array $config, array $settings, bool $preferProcess = false): int
+    {
+        $mode = strtolower((string) ($config['mode'] ?? ''));
+        if ($mode === 'process' || $mode === 'base') {
+            return $mode === 'process' ? SWOOLE_PROCESS : SWOOLE_BASE;
+        }
+        if ($preferProcess) {
+            return SWOOLE_PROCESS;
+        }
+        $workers = (int) ($settings['worker_num'] ?? (function_exists('swoole_cpu_num') ? swoole_cpu_num() : 1));
+
+        return $workers <= 1 ? SWOOLE_PROCESS : SWOOLE_BASE;
+    }
+
+    /** True when a server started with these options has a manager (SIGUSR1 reloads its workers). */
+    public static function reloadsWorkers(array $config, array $settings, bool $preferProcess = false): bool
+    {
+        if (self::serverMode($config, $settings, $preferProcess) === SWOOLE_PROCESS) {
+            return true;
+        }
+
+        return (int) ($settings['worker_num'] ?? (function_exists('swoole_cpu_num') ? swoole_cpu_num() : 1)) > 1;
     }
 
     public static function enableCoroutineHooks(): void

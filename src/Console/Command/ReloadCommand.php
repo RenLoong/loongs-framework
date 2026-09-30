@@ -9,7 +9,7 @@ use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-#[AsCommand(name: 'reload', description: 'Graceful reload: SIGUSR1 to the master, children reload their workers')]
+#[AsCommand(name: 'reload', description: 'Graceful reload: SIGUSR1 to the master; every child reloads with fresh code, in-flight requests finish')]
 final class ReloadCommand extends Command
 {
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -22,6 +22,7 @@ final class ReloadCommand extends Command
             return self::FAILURE;
         }
         $io->success(sprintf('Reload signal (SIGUSR1) sent to master pid %d.', $pid));
+        $io->writeln('  http / websocket: Swoole worker reload · rpc (uring): replacement, then the old one drains · queue / crontab / custom: graceful respawn. Progress: the master log (reload: …).');
 
         return self::SUCCESS;
     }

@@ -24,8 +24,7 @@ final class WebsocketProcess implements ProcessInterface
 
     public function handle(string $name, array $config): void
     {
-        $app = new Application($this->basePath, (isset($config['app']) && (string) $config['app'] !== '') ? (string) $config['app'] : null);
-        $container = $app->container();
+        $onlyApp = (isset($config['app']) && (string) $config['app'] !== '') ? (string) $config['app'] : null;
 
         $host = (string) ($config['host'] ?? Env::get('WS_HOST', '0.0.0.0'));
         $port = (int) ($config['port'] ?? Env::get('WS_PORT', 9503));
@@ -36,32 +35,38 @@ final class WebsocketProcess implements ProcessInterface
         ];
 
         $handlerClass = (string) ($config['handler'] ?? EchoHandler::class);
-        if (!class_exists($handlerClass) || !is_subclass_of($handlerClass, WebsocketHandlerInterface::class)) {
-            $handlerClass = EchoHandler::class;
-        }
 
-        /** @var WebsocketHandlerInterface $handler */
-        $handler = $container->has($handlerClass)
-            ? $container->make($handlerClass)
-            : new $handlerClass();
-
-        $server = new Server($host, $port);
+        $server = new Server($host, $port, WorkerPools::serverMode($config, $settings, preferProcess: true));
         if ($settings !== []) {
             $server->set($settings);
         }
 
-        WorkerPools::attach($server, $container);
+        // Application + handler per worker (not before the fork): `./loongs reload` → fresh code.
+        $basePath = $this->basePath;
+        $app = WorkerPools::attachPerWorker($server, static fn (): Application => new Application($basePath, $onlyApp));
+        $handler = null;
+        $resolve = static function () use ($app, $handlerClass, &$handler): WebsocketHandlerInterface {
+            if ($handler === null) {
+                $class = class_exists($handlerClass) && is_subclass_of($handlerClass, WebsocketHandlerInterface::class) ? $handlerClass : EchoHandler::class;
+                $container = $app()?->container();
+                /** @var WebsocketHandlerInterface $made */
+                $made = $container !== null && $container->has($class) ? $container->make($class) : new $class();
+                $handler = $made;
+            }
 
-        $server->on('open', static function (Server $server, SwooleRequest $request) use ($handler): void {
-            $handler->onOpen($server, $request);
+            return $handler;
+        };
+
+        $server->on('open', static function (Server $server, SwooleRequest $request) use ($resolve): void {
+            $resolve()->onOpen($server, $request);
         });
 
-        $server->on('message', static function (Server $server, Frame $frame) use ($handler): void {
-            $handler->onMessage($server, $frame);
+        $server->on('message', static function (Server $server, Frame $frame) use ($resolve): void {
+            $resolve()->onMessage($server, $frame);
         });
 
-        $server->on('close', static function (Server $server, int $fd) use ($handler): void {
-            $handler->onClose($server, $fd);
+        $server->on('close', static function (Server $server, int $fd) use ($resolve): void {
+            $resolve()->onClose($server, $fd);
         });
 
         ProcessLog::info(sprintf('WebSocket server starting on %s:%d handler=%s', $host, $port, $handlerClass));

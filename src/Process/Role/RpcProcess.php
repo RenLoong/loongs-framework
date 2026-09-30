@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Process\Role;
 
+use Loongs\Config\Repository;
 use Loongs\Container\Container;
 use Loongs\Http\Application;
 use Loongs\Http\Request;
@@ -34,7 +35,11 @@ use Throwable;
  */
 final class RpcProcess implements ProcessInterface
 {
-    /** Upper bound for draining in-flight requests on SIGTERM (master SIGKILLs after 15s). */
+    /**
+     * Upper bound for draining in-flight requests on SIGTERM — stop, or `./loongs reload`, where the
+     * master first starts a replacement on the same port (SO_REUSEPORT) and then SIGTERMs this one.
+     * The master SIGKILLs after 15s.
+     */
     private const MAX_DRAIN_SECONDS = 10;
 
     public function __construct(
@@ -44,12 +49,13 @@ final class RpcProcess implements ProcessInterface
 
     public function handle(string $name, array $config): void
     {
-        $onlyApp = isset($config['app']) ? (string) $config['app'] : null;
-        $app = new Application($this->basePath, $onlyApp !== '' ? $onlyApp : null);
-        $container = $app->container();
+        $onlyApp = isset($config['app']) && (string) $config['app'] !== '' ? (string) $config['app'] : null;
+        // Config only (no Application yet): the epoll server builds one per worker (reloadable),
+        // the uring server builds one in this process (reload = replacement process, see ProcessManager).
+        $appConfig = new Repository($this->basePath . '/config');
 
         /** @var array<string, mixed> $iouringConfig */
-        $iouringConfig = $app->config()->get('rpc.iouring', []);
+        $iouringConfig = $appConfig->get('rpc.iouring', []);
         if (!is_array($iouringConfig)) {
             $iouringConfig = [];
         }
@@ -68,15 +74,16 @@ final class RpcProcess implements ProcessInterface
         ];
         $settings = IoUringSupport::mergeServerSettings($settings, $iouring);
 
-        $path = (string) ($app->config()->get('rpc.path', '/rpc'));
+        $path = (string) ($appConfig->get('rpc.path', '/rpc'));
         if ($path === '') {
             $path = '/rpc';
         }
 
         if (IoUringSupport::usesNetworkUring($iouring)) {
-            $this->runUringServer($host, $port, $path, $settings, $container);
+            $app = new Application($this->basePath, $onlyApp);
+            $this->runUringServer($host, $port, $path, $settings, $app->container());
         } else {
-            $this->runEpollServer($host, $port, $path, $settings, $container);
+            $this->runEpollServer($host, $port, $path, $settings, $onlyApp, WorkerPools::serverMode($config, $settings));
         }
     }
 
@@ -239,16 +246,30 @@ final class RpcProcess implements ProcessInterface
         int $port,
         string $path,
         array $settings,
-        Container $container,
+        ?string $onlyApp,
+        int $mode,
     ): void {
-        $server = new HttpServer($host, $port);
+        $server = new HttpServer($host, $port, $mode);
         if ($settings !== []) {
             $server->set($settings);
         }
 
-        WorkerPools::attach($server, $container);
+        // Application per worker: `./loongs reload` → Swoole worker reload with fresh rpc handlers.
+        $basePath = $this->basePath;
+        $app = WorkerPools::attachPerWorker($server, static fn (): Application => new Application($basePath, $onlyApp));
+        $handler = null;
+        $server->on('request', function (SwooleRequest $req, SwooleResponse $res) use ($app, $path, &$handler): void {
+            if ($handler === null) {
+                $current = $app();
+                if ($current === null) {
+                    (new Response())->json([], 'worker not booted', 503, 503)->send($res);
 
-        $server->on('request', $this->makeRequestHandler($container, $path));
+                    return;
+                }
+                $handler = $this->makeRequestHandler($current->container(), $path);
+            }
+            $handler($req, $res);
+        });
 
         ProcessLog::info(sprintf(
             'RPC server starting Swoole\\Http\\Server network=epoll on %s:%d path=%s workers=%d',

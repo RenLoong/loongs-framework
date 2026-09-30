@@ -63,7 +63,8 @@ TXT);
         $iouring = $this->probeIoUring($manager);
         $report = $manager->statusReport();
         $planned = array_values(array_filter($report['processes'], static fn (array $p): bool => $p['enabled'] && $p['selected']));
-        if (!$report['running'] && $report['orphans'] === [] && $planned !== []) {
+        // No banner when start will be refused (running, orphans, same-named service of another project).
+        if (!$report['running'] && $report['orphans'] === [] && ($report['foreign'] ?? []) === [] && $planned !== []) {
             $this->renderBanner($io, $manager, $iouring, $daemon);
             if ($daemon) {
                 $rows = [];
