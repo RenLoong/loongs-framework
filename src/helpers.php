@@ -59,7 +59,7 @@ if (!function_exists('redis')) {
 
 if (!function_exists('rpc_services')) {
     /**
-     * RPC hot-switch code API (same implementation as `start rpc:*`).
+     * RPC hot-switch code API (same implementation as `loongs rpc:*`).
      *
      * rpc_services()->switch('user', 'remote', 'http://10.0.0.12:9502');
      * rpc_services()->set('user', [...]); ->reset('user'); ->resetAll(); ->show(); ->reload();

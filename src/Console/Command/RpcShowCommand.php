@@ -42,7 +42,7 @@ final class RpcShowCommand extends RpcCommand
         $this->renderServices($state);
 
         if ($o['state'] === 'invalid') {
-            $io->error('Override file invalid — workers keep their previous map: ' . $o['error'] . "\nFix it or run: ./start rpc:reset --all");
+            $io->error('Override file invalid — workers keep their previous map: ' . $o['error'] . "\nFix it or run: ./loongs rpc:reset --all");
         }
         if ($state['error'] !== null) {
             $io->error('Effective map invalid (workers would reject it): ' . $state['error']);

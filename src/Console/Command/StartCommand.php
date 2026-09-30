@@ -36,9 +36,9 @@ Runtime log lines: <comment>[time] LEVEL [tag] message</comment> (tag = master |
 Colours only on a TTY; <info>--no-ansi</info>, pipes, log files and daemon mode get plain text.
 <info>-q</info> hides the banner/table (runtime log lines still print).
 
-  <info>./start</info>                       same as <info>./start start</info>
-  <info>./start start --only=http,rpc</info>
-  <info>./start start --only='user.*' -d</info>
+  <info>./loongs</info>                       same as <info>./loongs start</info>
+  <info>./loongs start --only=http,rpc</info>
+  <info>./loongs start --only='user.*' -d</info>
 TXT);
     }
 
@@ -76,7 +76,7 @@ TXT);
                 }
                 $this->renderProcesses($io, $rows, $iouring);
                 $io->writeln(sprintf(
-                    ' <info>Running in the background.</info> Logs: <comment>%s</comment> · <comment>./start status</comment> · <comment>./start stop</comment>',
+                    ' <info>Running in the background.</info> Logs: <comment>%s</comment> · <comment>./loongs status</comment> · <comment>./loongs stop</comment>',
                     OutputFormatter::escape($this->relative($manager->logFile())),
                 ));
                 $io->newLine();
@@ -125,7 +125,7 @@ TXT);
             ['Log', $daemon
                 ? $e($this->relative($manager->logFile()))
                 : sprintf('stdout <fg=gray>(%s in daemon mode)</>', $e($this->relative($manager->logFile())))],
-            ['Mode', $daemon ? '<comment>daemon</comment>' : 'foreground <fg=gray>(Ctrl+C or ./start stop)</>'],
+            ['Mode', $daemon ? '<comment>daemon</comment>' : 'foreground <fg=gray>(Ctrl+C or ./loongs stop)</>'],
         ];
         foreach ($lines as [$key, $value]) {
             $io->writeln(sprintf('  <fg=gray>%-10s</> %s', $key, $value));

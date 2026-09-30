@@ -13,7 +13,7 @@ use Loongs\Support\Env;
 use Throwable;
 
 /**
- * Code API for RPC hot switch (the CLI `start rpc:*` uses this same class).
+ * Code API for RPC hot switch (the CLI `loongs rpc:*` uses this same class).
  *
  *   $rpc = rpc_services();                       // or inject RpcServiceManager
  *   $rpc->switch('user', 'loopback', 'http://127.0.0.1:9502');

@@ -21,12 +21,12 @@ use Symfony\Component\Console\Command\Command as SymfonyCommand;
 use Throwable;
 
 /**
- * `server/start` console (symfony/console). Pre-fork safe: never boots the HTTP Application.
+ * `server/loongs` console (symfony/console). Pre-fork safe: never boots the HTTP Application.
  *
- *   ./start                      → start (default command, keeps `./start --only=http` working)
- *   ./start start|stop|restart|reload|status
- *   ./start rpc:show|rpc:switch|rpc:set|rpc:reset
- *   ./start list / help <cmd>
+ *   ./loongs                      → start (default command, keeps `./loongs --only=http` working)
+ *   ./loongs start|stop|restart|reload|status
+ *   ./loongs rpc:show|rpc:switch|rpc:set|rpc:reset
+ *   ./loongs list / help <cmd>
  *
  * Extra commands (Symfony Command classes, #[AsCommand]):
  *   - server:  config/console.php            → ['commands' => [MyCommand::class, ...]]
@@ -59,7 +59,7 @@ final class Kernel extends SymfonyApplication
             $this->addLoongsCommand(new $class());
         }
 
-        // Backwards compatible: bare `./start` (optionally with --only=...) starts the server.
+        // Backwards compatible: bare `./loongs` (optionally with --only=...) starts the server.
         $this->setDefaultCommand('start');
     }
 

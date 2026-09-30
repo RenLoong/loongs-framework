@@ -14,7 +14,7 @@ use Throwable;
  *
  * $node (config rpc.node / env RPC_NODE): when non-empty every response carries
  * meta.served_by = {node, pid} so operators can see which instance served a call
- * (useful to verify `start rpc:switch`). Empty (default) keeps the wire format unchanged.
+ * (useful to verify `./loongs rpc:switch`). Empty (default) keeps the wire format unchanged.
  */
 final class RpcServer
 {

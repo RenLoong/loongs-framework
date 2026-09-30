@@ -866,7 +866,7 @@ final class ProcessManager
         }
 
         // Fallback when pcntl_signal is disabled: Swoole signal + brief event wait is not used
-        // in the poll loop; document running with `php -d disable_functions= start`.
+        // in the poll loop; document running with `php -d disable_functions= loongs`.
         ProcessLog::warn('pcntl_signal unavailable; run with php -d disable_functions= for stop/reload signals.');
         Process::signal(SIGTERM, $handleStop);
         Process::signal(SIGINT, $handleStop);
@@ -1023,12 +1023,12 @@ final class ProcessManager
                 }
                 if ($orphans !== []) {
                     throw new \RuntimeException(sprintf(
-                        'The master is gone but %d process(es) of the previous run are still alive (%s) and may hold the ports. Run ./start stop to clean them up.',
+                        'The master is gone but %d process(es) of the previous run are still alive (%s) and may hold the ports. Run ./loongs stop to clean them up.',
                         count($orphans),
                         implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $orphans)),
                     ));
                 }
-                throw new \RuntimeException("Another start is in progress (lock {$file} is held). Retry, or check ./start status.");
+                throw new \RuntimeException("Another start is in progress (lock {$file} is held). Retry, or check ./loongs status.");
             }
             usleep(50_000);
         }
@@ -1311,7 +1311,7 @@ final class ProcessManager
                 $owners === [] ? '' : ' by ' . implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), array_slice($owners, 0, 5))),
                 $error,
                 $ours !== []
-                    ? ' Leftover loong-swoole processes: run ./start stop (or stop the instance that owns them).'
+                    ? ' Leftover loong-swoole processes: run ./loongs stop (or stop the instance that owns them).'
                     : ' Free the port or change it in .env / config/process.php.',
             ));
         }

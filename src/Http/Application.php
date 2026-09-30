@@ -207,7 +207,7 @@ final class Application
             $reloader->setPeerBus(new \Swoole\Atomic(0));
         }
         $reloader->check(true);
-        // Code API for hot switch (same path as `start rpc:*`); also rpc_services().
+        // Code API for hot switch (same path as `loongs rpc:*`); also rpc_services().
         $this->container->instance(RpcServiceManager::class, new RpcServiceManager($reloader));
 
         $serviceRegistry = new ServiceRegistry($discovery);

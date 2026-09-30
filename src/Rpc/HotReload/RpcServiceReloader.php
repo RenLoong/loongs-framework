@@ -16,7 +16,7 @@ use Throwable;
  *
  * Sources (effective = config ⊕ overrides, override entry replaces the whole service):
  *   1. config/rpc.php  → 'services'   (re-included fresh; opcache invalidated first)
- *   2. runtime override JSON          (rpc.hot_reload.override_file, written by `start rpc:*`)
+ *   2. runtime override JSON          (rpc.hot_reload.override_file, written by `loongs rpc:*`)
  *
  * Every worker owns one reloader bound to its own ConfigServiceDiscovery. A Swoole timer
  * (rpc.hot_reload.interval_ms) calls check(): content fingerprints (sha256) of both files

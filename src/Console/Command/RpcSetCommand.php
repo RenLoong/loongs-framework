@@ -20,7 +20,7 @@ final class RpcSetCommand extends RpcCommand
             ->addArgument('service', InputArgument::REQUIRED, 'Service name')
             ->addArgument('json', InputArgument::REQUIRED, 'Service config as a JSON object')
             ->setHelp(<<<'TXT'
-  <info>./start rpc:set user '{"transport":"remote","instances":[{"endpoint":"http://10.0.0.1:9502","weight":1},{"endpoint":"http://10.0.0.2:9502","weight":3}]}'</info>
+  <info>./loongs rpc:set user '{"transport":"remote","instances":[{"endpoint":"http://10.0.0.1:9502","weight":1},{"endpoint":"http://10.0.0.2:9502","weight":3}]}'</info>
 TXT);
     }
 

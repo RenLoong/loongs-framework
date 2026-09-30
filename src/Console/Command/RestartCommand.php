@@ -18,8 +18,8 @@ final class RestartCommand extends StartCommand
 <info>stop</info> (SIGTERM, wait) followed by <info>start</info> with the same options.
 Use <info>reload</info> for a graceful in-place worker reload instead.
 
-  <info>./start restart -d</info>
-  <info>./start restart --only=http,rpc</info>
+  <info>./loongs restart -d</info>
+  <info>./loongs restart --only=http,rpc</info>
 TXT);
     }
 

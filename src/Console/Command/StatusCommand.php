@@ -35,7 +35,7 @@ final class StatusCommand extends Command
                     count($r['orphans']),
                     implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $r['orphans'])),
                 ));
-                $io->writeln('  → run <comment>./start stop</comment> to clean them up');
+                $io->writeln('  → run <comment>./loongs stop</comment> to clean them up');
             }
         }
         $io->writeln(sprintf('  pid file: %s', $r['pid_file']));

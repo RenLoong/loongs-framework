@@ -23,9 +23,9 @@ final class RpcSwitchCommand extends RpcCommand
 Keeps timeout_ms / metadata of the current entry. Strictly validated before the atomic write;
 running workers pick it up within rpc.hot_reload.interval_ms.
 
-  <info>./start rpc:switch user loopback</info>
-  <info>./start rpc:switch user remote http://10.0.0.12:9502</info>
-  <info>./start rpc:switch user local</info>
+  <info>./loongs rpc:switch user loopback</info>
+  <info>./loongs rpc:switch user remote http://10.0.0.12:9502</info>
+  <info>./loongs rpc:switch user local</info>
 TXT);
     }
 
