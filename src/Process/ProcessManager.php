@@ -48,6 +48,8 @@ final class ProcessManager
 
     private float $stopDeadline = 0.0;
 
+    private ?bool $daemonizeOverride = null;
+
     /** @param list<string>|null $only */
     public function __construct(string $basePath, ?array $only = null)
     {
@@ -75,21 +77,39 @@ final class ProcessManager
         $this->masterOptions['processes'] = AppProcessDiscovery::merge($globalProcesses, $appProcesses);
     }
 
-    public function start(): void
+    /**
+     * Force daemon mode on/off for this start (CLI `start -d`); null = config process.daemonize.
+     */
+    public function setDaemonize(?bool $daemonize): void
+    {
+        $this->daemonizeOverride = $daemonize;
+    }
+
+    public function daemonize(): bool
+    {
+        return $this->daemonizeOverride ?? !empty($this->masterOptions['daemonize']);
+    }
+
+    /**
+     * Run the master in the foreground (or daemonized) until stopped. Returns the exit code.
+     * Log lines stay plain text (no ANSI) so they are safe for log files / daemon mode.
+     *
+     * @throws \RuntimeException when already running or nothing is enabled (before forking)
+     */
+    public function start(): int
     {
         if ($this->isAlreadyRunning()) {
-            fwrite(STDERR, sprintf(
-                "Already running (pid %d). Use stop/reload/status.\n",
-                $this->readPid() ?? 0,
-            ));
-            exit(1);
+            throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $this->readPid() ?? 0));
+        }
+        if ($this->enabledEntries() === []) {
+            throw new \RuntimeException('No enabled processes to start (check config/process.php, .env and --only).');
         }
 
         $this->ensureRuntimeDir();
         $this->running = true;
         $this->stopping = false;
 
-        if (!empty($this->masterOptions['daemonize'])) {
+        if ($this->daemonize()) {
             Process::daemon(true, true);
         }
 
@@ -106,84 +126,111 @@ final class ProcessManager
 
         $this->installSignals();
         $this->supervise();
+
+        return 0;
     }
 
-    public function stop(): int
+    /**
+     * Stop the running master (SIGTERM, wait up to $timeout, then SIGKILL).
+     *
+     * $progress(string $event, array $context): events not_running | stopping | stopped | timeout.
+     * Returns 0 when stopped / not running, 1 when it had to SIGKILL.
+     *
+     * @param null|callable(string, array<string, mixed>): void $progress
+     */
+    public function stop(?callable $progress = null, float $timeout = 30.0): int
     {
+        $progress ??= static function (string $event, array $context): void {
+        };
         $pid = $this->readPid();
         if ($pid === null || !$this->pidAlive($pid)) {
             $this->unlinkPidFile();
-            echo "Not running.\n";
+            $progress('not_running', []);
 
             return 0;
         }
 
-        echo sprintf("Stopping master pid=%d ...\n", $pid);
+        $progress('stopping', ['pid' => $pid]);
         posix_kill($pid, SIGTERM);
 
-        $deadline = microtime(true) + 30.0;
+        $started = microtime(true);
+        $deadline = $started + $timeout;
         while (microtime(true) < $deadline) {
             if (!$this->pidAlive($pid)) {
                 $this->unlinkPidFile();
-                echo "Stopped.\n";
+                $progress('stopped', ['pid' => $pid, 'seconds' => round(microtime(true) - $started, 2)]);
 
                 return 0;
             }
             usleep(100_000);
         }
 
-        fwrite(STDERR, "Stop timed out; sending SIGKILL\n");
+        $progress('timeout', ['pid' => $pid]);
         posix_kill($pid, SIGKILL);
         $this->unlinkPidFile();
 
         return 1;
     }
 
-    public function reload(): int
+    /**
+     * Graceful reload (SIGUSR1 to the master → children reload). Returns the master pid,
+     * or null when not running.
+     */
+    public function reload(): ?int
     {
-        $pid = $this->readPid();
-        if ($pid === null || !$this->pidAlive($pid)) {
-            echo "Not running.\n";
-
-            return 1;
+        $pid = $this->masterPid();
+        if ($pid === null) {
+            return null;
         }
-
-        echo sprintf("Reloading master pid=%d (SIGUSR1)\n", $pid);
         posix_kill($pid, SIGUSR1);
 
-        return 0;
+        return $pid;
     }
 
-    public function status(): int
+    /** Alive master pid from the pid file, or null. */
+    public function masterPid(): ?int
     {
         $pid = $this->readPid();
-        $running = $pid !== null && $this->pidAlive($pid);
-        if (!$running) {
-            echo "status: stopped\n";
-            $this->unlinkPidFile();
-            $this->printProcessList();
 
-            return 1;
-        }
-
-        echo sprintf("status: running master_pid=%d pid_file=%s\n", $pid, $this->pidFilePath());
-        $this->printProcessList();
-
-        return 0;
+        return $pid !== null && $this->pidAlive($pid) ? $pid : null;
     }
 
-    private function printProcessList(): void
+    public function pidFile(): string
     {
-        /** @var mixed $processes */
-        $processes = $this->masterOptions['processes'] ?? [];
-        if (!is_array($processes) || $processes === []) {
-            echo "processes: (none)\n";
+        return $this->pidFilePath();
+    }
 
-            return;
+    public function logFile(): string
+    {
+        $rel = (string) ($this->masterOptions['log_file'] ?? 'runtime/loong-swoole.log');
+        if ($rel !== '' && ($rel[0] === '/' || (strlen($rel) > 2 && $rel[1] === ':'))) {
+            return $rel;
         }
 
-        echo "processes:\n";
-        foreach ($processes as $name => $cfg) {
+        return $this->basePath . '/' . ltrim($rel, '/\\');
+    }
+
+    /**
+     * Status snapshot for rendering (no output here).
+     *
+     * @return array{
+     *   running: bool, master_pid: ?int, pid_file: string, log_file: string, daemonize: bool,
+     *   processes: list<array{name: string, type: string, enabled: bool, selected: bool, app: string,
+     *     count: int, listen: ?string, workers: ?int, pids: list<int>, state: string}>
+     * }
+     */
+    public function statusReport(): array
+    {
+        $masterPid = $this->masterPid();
+        if ($masterPid === null) {
+            $this->unlinkPidFile();
+        }
+        $childPids = $masterPid !== null ? $this->childPidsByName($masterPid) : [];
+
+        $rows = [];
+        /** @var mixed $processes */
+        $processes = $this->masterOptions['processes'] ?? [];
+        foreach (is_array($processes) ? $processes : [] as $name => $cfg) {
             if (!is_string($name) || !is_array($cfg)) {
                 continue;
             }
@@ -191,25 +238,75 @@ final class ProcessManager
             if (is_string($enabled)) {
                 $enabled = filter_var($enabled, FILTER_VALIDATE_BOOLEAN);
             }
-            $type = (string) ($cfg['type'] ?? $name);
-            $app = isset($cfg['_app']) ? (string) $cfg['_app'] : (isset($cfg['app']) ? (string) $cfg['app'] : '-');
-            echo sprintf(
-                "  - %-24s type=%-10s enabled=%s app=%s\n",
-                $name,
-                $type,
-                $enabled ? 'true' : 'false',
-                $app,
-            );
+            $enabled = (bool) $enabled;
+            $selected = $this->only === null || $this->matchesOnly(strtolower($name));
+            $listen = isset($cfg['port']) ? ((string) ($cfg['host'] ?? '0.0.0.0')) . ':' . (int) $cfg['port'] : null;
+            $workers = isset($cfg['settings']['worker_num']) ? (int) $cfg['settings']['worker_num'] : null;
+            $pids = $childPids[$name] ?? [];
+            $state = match (true) {
+                $pids !== [] => 'running',
+                !$enabled => 'disabled',
+                $masterPid === null => 'stopped',
+                default => 'not running',
+            };
+            $rows[] = [
+                'name' => $name,
+                'type' => (string) ($cfg['type'] ?? $name),
+                'enabled' => $enabled,
+                'selected' => $selected,
+                'app' => isset($cfg['_app']) ? (string) $cfg['_app'] : (isset($cfg['app']) ? (string) $cfg['app'] : '-'),
+                'count' => max(1, (int) ($cfg['count'] ?? 1)),
+                'listen' => $listen,
+                'workers' => $workers,
+                'pids' => $pids,
+                'state' => $state,
+            ];
         }
+
+        return [
+            'running' => $masterPid !== null,
+            'master_pid' => $masterPid,
+            'pid_file' => $this->pidFilePath(),
+            'log_file' => $this->logFile(),
+            'daemonize' => $this->daemonize(),
+            'processes' => $rows,
+        ];
+    }
+
+    /**
+     * Direct children of the master, keyed by process name (from the child title
+     * "loong-swoole: <name>[#i]" set in runChild()). Linux /proc only; empty elsewhere.
+     *
+     * @return array<string, list<int>>
+     */
+    private function childPidsByName(int $masterPid): array
+    {
+        $out = [];
+        foreach (glob('/proc/[0-9]*/stat') ?: [] as $statFile) {
+            $stat = @file_get_contents($statFile);
+            if (!is_string($stat) || ($rp = strrpos($stat, ')')) === false) {
+                continue;
+            }
+            $fields = explode(' ', substr($stat, $rp + 2));
+            if ((int) ($fields[1] ?? 0) !== $masterPid) {
+                continue;
+            }
+            $pid = (int) basename(dirname($statFile));
+            $cmd = trim(str_replace("\0", ' ', (string) @file_get_contents('/proc/' . $pid . '/cmdline')));
+            if (preg_match('/' . preg_quote(self::TITLE_PREFIX, '/') . ': ([^\s#]+)/', $cmd, $m) === 1) {
+                $out[$m[1]][] = $pid;
+            }
+        }
+        foreach ($out as &$pids) {
+            sort($pids);
+        }
+
+        return $out;
     }
 
     private function spawnAll(): void
     {
         $entries = $this->enabledEntries();
-        if ($entries === []) {
-            fwrite(STDERR, "No enabled processes to start.\n");
-            exit(1);
-        }
 
         foreach ($entries as $name => $cfg) {
             $count = max(1, (int) ($cfg['count'] ?? 1));

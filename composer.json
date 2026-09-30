@@ -5,7 +5,8 @@
     "license": "MIT",
     "require": {
         "php": "^8.4",
-        "ext-swoole": "^6"
+        "ext-swoole": "^6",
+        "symfony/console": "^7.4 || ^8.0"
     },
     "suggest": {
         "ext-pdo": "Required for Loongs\\Database PDO pools",
