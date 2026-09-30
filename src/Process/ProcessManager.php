@@ -27,6 +27,12 @@ final class ProcessManager
 {
     private const TITLE_PREFIX = 'loong-swoole';
 
+    /** Graceful stop budget for children before the master SIGKILLs the whole tree. */
+    private const STOP_GRACE = 15.0;
+
+    /** Watchdog: how long an orphaned child (master gone) gets after SIGTERM before SIGKILL. */
+    private const ORPHAN_GRACE = 15.0;
+
     private string $basePath;
 
     /** @var list<string>|null */
@@ -56,6 +62,18 @@ final class ProcessManager
 
     /** @var null|callable(list<array<string, mixed>>, float): void */
     private $onStarted = null;
+
+    /**
+     * Instance lock (flock LOCK_EX on <pid file>.lock), held by the master for its lifetime.
+     * Children inherit the descriptor (same open file description), so the lock stays held while
+     * any process of this instance is alive — that is how orphans are detected. Only the master
+     * ever calls flock(LOCK_UN) (PHP's fclose / process exit do not unlock).
+     *
+     * @var resource|null
+     */
+    private $lockHandle = null;
+
+    private bool $forced = false;
 
     /** @param list<string>|null $only */
     public function __construct(string $basePath, ?array $only = null)
@@ -125,28 +143,38 @@ final class ProcessManager
      */
     public function start(): int
     {
-        if ($this->isAlreadyRunning()) {
-            throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $this->readPid() ?? 0));
-        }
         if ($this->enabledEntries() === []) {
             throw new \RuntimeException('No enabled processes to start (check config/process.php, .env and --only).');
         }
 
         $this->ensureRuntimeDir();
+        // Lock before any fork / daemonize: two concurrent `start`s → exactly one wins.
+        $this->acquireLock();
+        $this->writePidFile((int) getmypid());
+        try {
+            $this->assertPortsFree();
+        } catch (\RuntimeException $e) {
+            $this->unlinkPidFile();
+            $this->releaseLock();
+            throw $e;
+        }
+
         $this->running = true;
         $this->stopping = false;
+        $this->forced = false;
         $this->startedAt = microtime(true);
 
         if ($this->daemonize()) {
             ProcessLog::setAnsi(false);
+            // The daemon inherits the locked descriptor; the CLI parent exits without unlocking.
             $this->daemonizeToLogFile();
+            $this->writePidFile((int) getmypid());
         }
 
         ProcessLog::setTag('master');
         ProcessLog::setTagWidth($this->longestTag());
         $this->setTitle('master');
         $this->spawnAll();
-        $this->writePidFile((int) getmypid());
         $this->installSignals();
 
         $rows = $this->waitReady();
@@ -169,27 +197,39 @@ final class ProcessManager
 
         $this->supervise();
 
-        return 0;
+        return $this->forced ? 1 : 0;
     }
 
     /**
-     * Stop the running master (SIGTERM, wait up to $timeout, then SIGKILL).
+     * Stop this instance.
      *
-     * $progress(string $event, array $context): events not_running | stopping | stopped | timeout.
-     * Returns 0 when stopped / not running, 1 when it had to SIGKILL.
+     * Master alive: SIGTERM, wait until the master AND every process holding the instance lock are
+     * gone (ports free), else after $timeout SIGKILL the master plus all lock holders.
+     * Master gone but orphans alive (kill -9 / crash): SIGTERM the orphaned children, wait up to
+     * $orphanTimeout, then SIGKILL every remaining lock holder.
+     * A stale pid file (pid reused by an unrelated process) is never signalled.
+     *
+     * $progress(string $event, array $context): not_running | stopping | stopped | timeout
+     *   | orphans | orphans_stopped | orphans_killed.
+     * Returns 0 when stopped gracefully / not running, 1 when it had to SIGKILL.
      *
      * @param null|callable(string, array<string, mixed>): void $progress
      */
-    public function stop(?callable $progress = null, float $timeout = 30.0): int
+    public function stop(?callable $progress = null, float $timeout = 30.0, float $orphanTimeout = 10.0): int
     {
         $progress ??= static function (string $event, array $context): void {
         };
-        $pid = $this->readPid();
-        if ($pid === null || !$this->pidAlive($pid)) {
-            $this->unlinkPidFile();
-            $progress('not_running', []);
+        $pid = $this->masterPid();
+        if ($pid === null) {
+            $holders = $this->lockHolders() ?? [];
+            if ($holders === [] || !$this->lockHeld()) {
+                $this->unlinkStalePidFile();
+                $progress('not_running', []);
 
-            return 0;
+                return 0;
+            }
+
+            return $this->stopOrphans($holders, $progress, $orphanTimeout);
         }
 
         $progress('stopping', ['pid' => $pid]);
@@ -198,8 +238,8 @@ final class ProcessManager
         $started = microtime(true);
         $deadline = $started + $timeout;
         while (microtime(true) < $deadline) {
-            if (!$this->pidAlive($pid)) {
-                $this->unlinkPidFile();
+            if (!$this->pidAlive($pid) && !$this->lockHeld()) {
+                $this->unlinkStalePidFile();
                 $progress('stopped', ['pid' => $pid, 'seconds' => round(microtime(true) - $started, 2)]);
 
                 return 0;
@@ -207,9 +247,42 @@ final class ProcessManager
             usleep(100_000);
         }
 
-        $progress('timeout', ['pid' => $pid]);
-        posix_kill($pid, SIGKILL);
-        $this->unlinkPidFile();
+        $pids = array_values(array_unique(array_merge([$pid], $this->lockHolders() ?? [])));
+        foreach ($pids as $p) {
+            @posix_kill($p, SIGKILL);
+        }
+        $this->waitUnlocked(2.0);
+        $progress('timeout', ['pid' => $pid, 'killed' => $pids]);
+        $this->unlinkStalePidFile();
+
+        return 1;
+    }
+
+    /**
+     * @param list<int> $holders
+     * @param callable(string, array<string, mixed>): void $progress
+     */
+    private function stopOrphans(array $holders, callable $progress, float $timeout): int
+    {
+        $top = $this->topLevel($holders);
+        $progress('orphans', ['pids' => $top, 'count' => count($holders), 'processes' => $this->describe($top)]);
+        foreach ($top as $p) {
+            @posix_kill($p, SIGTERM);
+        }
+        $started = microtime(true);
+        if ($this->waitUnlocked($timeout)) {
+            $this->unlinkStalePidFile();
+            $progress('orphans_stopped', ['count' => count($holders), 'seconds' => round(microtime(true) - $started, 2)]);
+
+            return 0;
+        }
+        $left = $this->lockHolders() ?? [];
+        foreach ($left as $p) {
+            @posix_kill($p, SIGKILL);
+        }
+        $this->waitUnlocked(2.0);
+        $this->unlinkStalePidFile();
+        $progress('orphans_killed', ['pids' => $left, 'seconds' => round(microtime(true) - $started, 2)]);
 
         return 1;
     }
@@ -229,12 +302,45 @@ final class ProcessManager
         return $pid;
     }
 
-    /** Alive master pid from the pid file, or null. */
+    /**
+     * Pid of the live master of this instance, or null. "Running" means the instance lock is held
+     * AND the pid file names a live process that holds it — so a stale pid file whose pid was reused
+     * by an unrelated process does not count (PID reuse), and neither do orphans without a master.
+     */
     public function masterPid(): ?int
     {
         $pid = $this->readPid();
+        if ($pid === null || !$this->pidAlive($pid) || !$this->lockHeld()) {
+            return null;
+        }
+        $holders = $this->lockHolders();
+        if ($holders !== null && !in_array($pid, $holders, true)) {
+            return null;
+        }
 
-        return $pid !== null && $this->pidAlive($pid) ? $pid : null;
+        return $pid;
+    }
+
+    /** Lock file guarding this instance: <pid file without .pid>.lock (never unlinked). */
+    public function lockFile(): string
+    {
+        $pid = $this->pidFilePath();
+
+        return (str_ends_with($pid, '.pid') ? substr($pid, 0, -4) : $pid) . '.lock';
+    }
+
+    /**
+     * Processes of this instance that are alive although the master is gone (top level only).
+     *
+     * @return list<array{pid: int, ppid: int, title: string}>
+     */
+    public function orphans(): array
+    {
+        if ($this->masterPid() !== null || !$this->lockHeld()) {
+            return [];
+        }
+
+        return $this->describe($this->topLevel($this->lockHolders() ?? []));
     }
 
     public function pidFile(): string
@@ -264,10 +370,20 @@ final class ProcessManager
     public function statusReport(): array
     {
         $masterPid = $this->masterPid();
-        if ($masterPid === null) {
-            $this->unlinkPidFile();
+        $orphans = $masterPid === null ? $this->orphans() : [];
+        if ($masterPid === null && $orphans === []) {
+            $this->unlinkStalePidFile();
         }
-        $childPids = $masterPid !== null ? $this->childPidsByName($masterPid) : [];
+        $childPids = [];
+        if ($masterPid !== null) {
+            $childPids = $this->childPidsByName($masterPid);
+        } else {
+            foreach ($orphans as $o) {
+                if (preg_match('/^' . preg_quote(self::TITLE_PREFIX, '/') . ': ([^\s#]+)/', $o['title'], $mm) === 1 && $mm[1] !== 'watchdog') {
+                    $childPids[$mm[1]][] = $o['pid'];
+                }
+            }
+        }
 
         $rows = [];
         /** @var mixed $processes */
@@ -286,7 +402,7 @@ final class ProcessManager
             $workers = isset($cfg['settings']['worker_num']) ? (int) $cfg['settings']['worker_num'] : null;
             $pids = $childPids[$name] ?? [];
             $state = match (true) {
-                $pids !== [] => 'running',
+                $pids !== [] => $masterPid !== null ? 'running' : 'orphaned',
                 !$enabled => 'disabled',
                 $masterPid === null => 'stopped',
                 default => 'not running',
@@ -308,6 +424,7 @@ final class ProcessManager
         return [
             'running' => $masterPid !== null,
             'master_pid' => $masterPid,
+            'orphans' => $orphans,
             'pid_file' => $this->pidFilePath(),
             'log_file' => $this->logFile(),
             'daemonize' => $this->daemonize(),
@@ -557,6 +674,8 @@ final class ProcessManager
             pcntl_signal(SIGUSR1, SIG_DFL);
             pcntl_signal(SIGINT, SIG_IGN);
         }
+        // Forked before the role binds any socket, so the watchdog never holds ports.
+        $this->startWatchdog($name . '#' . $index);
 
         $processType = ProcessType::tryFromConfig($type);
         if ($processType === null) {
@@ -607,13 +726,13 @@ final class ProcessManager
                     break;
                 }
                 if ($this->stopDeadline > 0 && microtime(true) >= $this->stopDeadline) {
-                    foreach ($this->children as $k => $child) {
+                    foreach ($this->children as $child) {
                         if ($child['pid'] > 0 && $this->pidAlive($child['pid'])) {
-                            ProcessLog::warn(sprintf('stop timeout: SIGKILL %s#%d pid=%d', $child['name'], $child['index'], $child['pid']));
-                            posix_kill($child['pid'], SIGKILL);
+                            ProcessLog::warn(sprintf('stop timeout (%ds): SIGKILL %s#%d pid=%d', (int) self::STOP_GRACE, $child['name'], $child['index'], $child['pid']));
                         }
-                        unset($this->children[$k]);
                     }
+                    $this->killTree();
+                    $this->reapChildren(1.0);
                     break;
                 }
             }
@@ -622,10 +741,22 @@ final class ProcessManager
         }
 
         $this->running = false;
+        if ($this->forced) {
+            $this->reapChildren(1.0);
+        }
+        // Watchdogs / grandchildren still holding the lock: give them a moment, then SIGKILL.
+        if (!$this->waitUnlocked(2.0, true)) {
+            $left = $this->lockHolders() ?? [];
+            ProcessLog::warn(sprintf('SIGKILL %d leftover process(es): %s', count($left), implode(',', $left)));
+            $this->killTree();
+            $this->waitUnlocked(1.0, true);
+        }
         $this->unlinkPidFile();
+        $this->releaseLock();
         $now = microtime(true);
         ProcessLog::info(sprintf(
-            'ProcessManager exited%s uptime=%s',
+            'ProcessManager exited%s%s uptime=%s',
+            $this->forced ? ' (forced)' : '',
             $this->stopStartedAt > 0 ? ' shutdown=' . ProcessLog::duration($now - $this->stopStartedAt) : '',
             ProcessLog::duration($now - $this->startedAt),
         ));
@@ -702,6 +833,8 @@ final class ProcessManager
     {
         $handleStop = function (int $signo = SIGTERM) {
             if ($this->stopping) {
+                $this->forceStop($signo);
+
                 return;
             }
             $this->stopping = true;
@@ -716,7 +849,7 @@ final class ProcessManager
                     posix_kill($child['pid'], SIGTERM);
                 }
             }
-            $this->stopDeadline = microtime(true) + 15.0;
+            $this->stopDeadline = microtime(true) + self::STOP_GRACE;
         };
 
         if (function_exists('pcntl_async_signals')) {
@@ -857,11 +990,424 @@ final class ProcessManager
         return (int) $raw;
     }
 
-    private function isAlreadyRunning(): bool
+    /**
+     * Take the instance lock (LOCK_EX|LOCK_NB). Refuses when a master runs, or when orphans of a
+     * dead master still hold it. Retries ~1s so a status probe (LOCK_SH) or the last watchdog of a
+     * just-finished shutdown does not cause a spurious refusal.
+     */
+    private function acquireLock(): void
     {
-        $pid = $this->readPid();
+        $file = $this->lockFile();
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $fh = @fopen($file, 'c');
+        if (!is_resource($fh)) {
+            throw new \RuntimeException("Cannot open lock file {$file}.");
+        }
+        $deadline = microtime(true) + 1.0;
+        while (!flock($fh, LOCK_EX | LOCK_NB)) {
+            $master = $this->masterPid();
+            if ($master !== null) {
+                fclose($fh);
+                throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $master));
+            }
+            if (microtime(true) >= $deadline) {
+                fclose($fh);
+                $orphans = $this->describe($this->topLevel($this->lockHolders() ?? []));
+                foreach ($orphans as $o) {
+                    if (str_ends_with($o['title'], ': master')) {
+                        throw new \RuntimeException(sprintf('Already running (pid %d). Use stop/reload/status.', $o['pid']));
+                    }
+                }
+                if ($orphans !== []) {
+                    throw new \RuntimeException(sprintf(
+                        'The master is gone but %d process(es) of the previous run are still alive (%s) and may hold the ports. Run ./start stop to clean them up.',
+                        count($orphans),
+                        implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $orphans)),
+                    ));
+                }
+                throw new \RuntimeException("Another start is in progress (lock {$file} is held). Retry, or check ./start status.");
+            }
+            usleep(50_000);
+        }
+        $this->lockHandle = $fh;
+    }
 
-        return $pid !== null && $this->pidAlive($pid);
+    /**
+     * Remove the pid file only when provably nobody runs this instance: we are the master, or we can
+     * take the lock ourselves (a starter writes the pid file only while holding it). Avoids a racing
+     * `status` / losing `start` deleting the pid file a new master just wrote.
+     */
+    private function unlinkStalePidFile(): void
+    {
+        if (is_resource($this->lockHandle)) {
+            $this->unlinkPidFile();
+
+            return;
+        }
+        $file = $this->lockFile();
+        if (!is_file($file)) {
+            $this->unlinkPidFile();
+
+            return;
+        }
+        $fh = @fopen($file, 'c');
+        if (!is_resource($fh)) {
+            return;
+        }
+        if (flock($fh, LOCK_EX | LOCK_NB)) {
+            $this->unlinkPidFile();
+            flock($fh, LOCK_UN);
+        }
+        fclose($fh);
+    }
+
+    private function releaseLock(): void
+    {
+        if (is_resource($this->lockHandle)) {
+            flock($this->lockHandle, LOCK_UN);
+            fclose($this->lockHandle);
+        }
+        $this->lockHandle = null;
+    }
+
+    /** True when some process holds the instance lock (probe with LOCK_SH|LOCK_NB, released at once). */
+    private function lockHeld(): bool
+    {
+        $file = $this->lockFile();
+        if (!is_file($file)) {
+            return false;
+        }
+        $fh = @fopen($file, 'r');
+        if (!is_resource($fh)) {
+            return false;
+        }
+        $free = flock($fh, LOCK_SH | LOCK_NB);
+        if ($free) {
+            flock($fh, LOCK_UN);
+        }
+        fclose($fh);
+
+        return !$free;
+    }
+
+    /** Wait until nobody (or, with $exceptSelf, nobody but this process) holds the lock. */
+    private function waitUnlocked(float $timeout, bool $exceptSelf = false): bool
+    {
+        $deadline = microtime(true) + $timeout;
+        do {
+            $free = $exceptSelf ? ($this->lockHolders() ?? []) === [] : !$this->lockHeld();
+            if ($free) {
+                return true;
+            }
+            usleep(50_000);
+        } while (microtime(true) < $deadline);
+
+        return false;
+    }
+
+    /**
+     * Pids (other than this one) with an open descriptor on the lock file, via /proc/<pid>/fd.
+     * Null when /proc is unavailable (non-Linux).
+     *
+     * @return list<int>|null
+     */
+    private function lockHolders(): ?array
+    {
+        if (!is_dir('/proc/self/fd')) {
+            return null;
+        }
+        $file = $this->lockFile();
+        $target = realpath($file) ?: $file;
+
+        return $this->pidsWithFd(static fn (string $link): bool => $link === $target);
+    }
+
+    /**
+     * @param callable(string): bool $match
+     * @return list<int>
+     */
+    private function pidsWithFd(callable $match): array
+    {
+        $self = (int) getmypid();
+        $out = [];
+        foreach (glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: [] as $dir) {
+            $pid = (int) basename($dir);
+            if ($pid === $self) {
+                continue;
+            }
+            foreach (@scandir($dir . '/fd') ?: [] as $fd) {
+                if ($fd === '.' || $fd === '..') {
+                    continue;
+                }
+                $link = @readlink($dir . '/fd/' . $fd);
+                if (is_string($link) && $match($link)) {
+                    $out[] = $pid;
+                    break;
+                }
+            }
+        }
+        sort($out);
+
+        return $out;
+    }
+
+    /**
+     * @param list<int> $pids
+     * @return list<int> pids whose parent is not in $pids (the tree roots)
+     */
+    private function topLevel(array $pids): array
+    {
+        return array_values(array_filter($pids, fn (int $p): bool => !in_array($this->parentPid($p), $pids, true)));
+    }
+
+    /**
+     * @param list<int> $pids
+     * @return list<array{pid: int, ppid: int, title: string}>
+     */
+    private function describe(array $pids): array
+    {
+        $out = [];
+        foreach ($pids as $pid) {
+            $title = $this->processTitle($pid);
+            if (strlen($title) > 60) {
+                $title = substr($title, 0, 57) . '...';
+            }
+            $out[] = ['pid' => $pid, 'ppid' => (int) ($this->parentPid($pid) ?? 0), 'title' => $title];
+        }
+
+        return $out;
+    }
+
+    private function parentPid(int $pid): ?int
+    {
+        $stat = @file_get_contents('/proc/' . $pid . '/stat');
+        if (!is_string($stat) || ($rp = strrpos($stat, ')')) === false) {
+            return null;
+        }
+        $fields = explode(' ', substr($stat, $rp + 2));
+
+        return isset($fields[1]) ? (int) $fields[1] : null;
+    }
+
+    private function processTitle(int $pid): string
+    {
+        $cmd = trim(str_replace("\0", ' ', (string) @file_get_contents('/proc/' . $pid . '/cmdline')));
+
+        return $cmd !== '' ? $cmd : '?';
+    }
+
+    /**
+     * Every descendant of $pid (via /proc ppid links), deepest last.
+     *
+     * @return list<int>
+     */
+    private function descendants(int $pid): array
+    {
+        $parents = [];
+        foreach (glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: [] as $dir) {
+            $p = (int) basename($dir);
+            $pp = $this->parentPid($p);
+            if ($pp !== null) {
+                $parents[$pp][] = $p;
+            }
+        }
+        $out = [];
+        $queue = [$pid];
+        while ($queue !== []) {
+            $cur = array_shift($queue);
+            foreach ($parents[$cur] ?? [] as $c) {
+                $out[] = $c;
+                $queue[] = $c;
+            }
+        }
+
+        return $out;
+    }
+
+    /** SIGKILL every child and every other process holding the instance lock (grandchildren, watchdogs). */
+    private function killTree(): void
+    {
+        $pids = $this->lockHolders() ?? [];
+        foreach ($this->children as $child) {
+            if ($child['pid'] > 0) {
+                $pids[] = $child['pid'];
+            }
+        }
+        foreach (array_unique($pids) as $p) {
+            @posix_kill($p, SIGKILL);
+        }
+    }
+
+    /** Reap exited children (logging "child exit" lines) until none are left or $timeout passes. */
+    private function reapChildren(float $timeout): void
+    {
+        $deadline = microtime(true) + $timeout;
+        while ($this->children !== [] && microtime(true) < $deadline) {
+            $ret = Process::wait(false);
+            if (is_array($ret) && isset($ret['pid'])) {
+                $this->onChildExit((int) $ret['pid'], (int) ($ret['code'] ?? 0), (int) ($ret['signal'] ?? 0));
+                continue;
+            }
+            usleep(20_000);
+        }
+        $this->children = [];
+    }
+
+    /** Second SIGINT/SIGTERM while shutting down: SIGKILL the whole tree now. */
+    private function forceStop(int $signo): void
+    {
+        if ($this->forced) {
+            return;
+        }
+        $this->forced = true;
+        $pids = $this->lockHolders() ?? [];
+        foreach ($this->children as $child) {
+            if ($child['pid'] > 0) {
+                $pids[] = $child['pid'];
+            }
+        }
+        $pids = array_values(array_unique($pids));
+        sort($pids);
+        ProcessLog::warn(sprintf(
+            '%s again during shutdown (after %s): force exit — SIGKILL %d process(es): %s',
+            $signo === SIGINT ? 'SIGINT' : ($signo === SIGTERM ? 'SIGTERM' : 'signal ' . $signo),
+            ProcessLog::duration(microtime(true) - $this->stopStartedAt),
+            count($pids),
+            implode(',', $pids),
+        ));
+        foreach ($pids as $p) {
+            @posix_kill($p, SIGKILL);
+        }
+        $this->running = false;
+    }
+
+    /**
+     * Refuse to start when a configured port is already bound (orphans, another instance, anything).
+     * Probes with a plain bind (no SO_REUSEPORT), so it also catches an RPC server that would
+     * otherwise let a second SO_REUSEPORT listener co-bind the port.
+     */
+    private function assertPortsFree(): void
+    {
+        foreach ($this->enabledEntries() as $name => $cfg) {
+            $port = (int) ($cfg['port'] ?? 0);
+            if ($port <= 0) {
+                continue;
+            }
+            $host = (string) ($cfg['host'] ?? '0.0.0.0');
+            $error = $this->bindProbe($host, $port);
+            if ($error === null) {
+                continue;
+            }
+            $owners = $this->describe($this->portOwners($port));
+            $ours = array_filter($owners, static fn (array $o): bool => str_starts_with($o['title'], self::TITLE_PREFIX . ':'));
+            throw new \RuntimeException(sprintf(
+                'Port %s:%d for [%s] is already in use%s (%s).%s',
+                $host,
+                $port,
+                $name,
+                $owners === [] ? '' : ' by ' . implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), array_slice($owners, 0, 5))),
+                $error,
+                $ours !== []
+                    ? ' Leftover loong-swoole processes: run ./start stop (or stop the instance that owns them).'
+                    : ' Free the port or change it in .env / config/process.php.',
+            ));
+        }
+    }
+
+    private function bindProbe(string $host, int $port): ?string
+    {
+        $h = $host === '' ? '0.0.0.0' : $host;
+        if (str_contains($h, ':') && $h[0] !== '[') {
+            $h = '[' . $h . ']';
+        }
+        $ctx = stream_context_create(['socket' => ['so_reuseport' => false, 'backlog' => 1]]);
+        $server = @stream_socket_server('tcp://' . $h . ':' . $port, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+        if ($server === false) {
+            return $errstr !== '' ? $errstr : 'errno ' . $errno;
+        }
+        fclose($server);
+
+        return null;
+    }
+
+    /**
+     * Top-level pids listening on TCP $port (/proc/net/tcp{,6} LISTEN inodes → /proc/<pid>/fd).
+     *
+     * @return list<int>
+     */
+    private function portOwners(int $port): array
+    {
+        $inodes = [];
+        foreach (['/proc/net/tcp', '/proc/net/tcp6'] as $table) {
+            foreach (@file($table, FILE_IGNORE_NEW_LINES) ?: [] as $i => $line) {
+                $f = preg_split('/\s+/', trim($line));
+                if ($i === 0 || !is_array($f) || count($f) < 10 || $f[3] !== '0A') {
+                    continue;
+                }
+                $local = explode(':', $f[1]);
+                if (hexdec((string) end($local)) === $port) {
+                    $inodes['socket:[' . $f[9] . ']'] = true;
+                }
+            }
+        }
+        if ($inodes === []) {
+            return [];
+        }
+        $pids = $this->pidsWithFd(static fn (string $link): bool => isset($inodes[$link]));
+
+        return $this->topLevel($pids);
+    }
+
+    /**
+     * Per-child watchdog (forked in the child before the role starts): if the master disappears
+     * (kill -9, crash, terminal closed) the child is re-parented; the watchdog notices within
+     * ~200ms, sends SIGTERM for a graceful stop and SIGKILLs the child's tree after ORPHAN_GRACE.
+     * It exits by itself as soon as the child is gone.
+     */
+    private function startWatchdog(string $tag): void
+    {
+        if (!function_exists('posix_getppid') || !function_exists('posix_kill')) {
+            return;
+        }
+        $masterPid = posix_getppid();
+        $childPid = (int) getmypid();
+        if ($masterPid <= 1) {
+            return;
+        }
+        $watchdog = new Process(function () use ($tag, $masterPid, $childPid): void {
+            $this->setTitle('watchdog ' . $tag);
+            ProcessLog::setTag($tag);
+            while (true) {
+                usleep(200_000);
+                if (posix_getppid() !== $childPid) {
+                    exit(0);
+                }
+                $ppid = $this->parentPid($childPid);
+                if (@posix_kill($masterPid, 0) && ($ppid === null || $ppid === $masterPid)) {
+                    continue;
+                }
+                ProcessLog::warn(sprintf('master pid=%d is gone — stopping orphaned %s pid=%d (SIGTERM, SIGKILL after %ds)', $masterPid, $tag, $childPid, (int) self::ORPHAN_GRACE));
+                $t0 = microtime(true);
+                @posix_kill($childPid, SIGTERM);
+                while (microtime(true) - $t0 < self::ORPHAN_GRACE) {
+                    usleep(100_000);
+                    if (posix_getppid() !== $childPid) {
+                        ProcessLog::info(sprintf('orphaned %s pid=%d exited after %s', $tag, $childPid, ProcessLog::duration(microtime(true) - $t0)));
+                        exit(0);
+                    }
+                }
+                $tree = array_values(array_diff($this->descendants($childPid), [(int) getmypid()]));
+                ProcessLog::warn(sprintf('orphaned %s pid=%d did not stop in %ds: SIGKILL %d process(es)', $tag, $childPid, (int) self::ORPHAN_GRACE, count($tree) + 1));
+                foreach (array_merge([$childPid], $tree) as $p) {
+                    @posix_kill($p, SIGKILL);
+                }
+                exit(0);
+            }
+        }, false, 0, false);
+        $watchdog->start();
     }
 
     private function pidAlive(int $pid): bool

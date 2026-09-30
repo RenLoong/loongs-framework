@@ -29,6 +29,14 @@ final class StatusCommand extends Command
             $io->writeln(sprintf('  master: <info>running</info>  pid=<comment>%d</comment>', $r['master_pid']));
         } else {
             $io->writeln('  master: <fg=red;options=bold>stopped</>');
+            if ($r['orphans'] !== []) {
+                $io->writeln(sprintf(
+                    '  <fg=red;options=bold>orphaned</>: the master is gone but %d process(es) are still alive: %s',
+                    count($r['orphans']),
+                    implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), $r['orphans'])),
+                ));
+                $io->writeln('  → run <comment>./start stop</comment> to clean them up');
+            }
         }
         $io->writeln(sprintf('  pid file: %s', $r['pid_file']));
         if ($output->isVerbose()) {
@@ -43,6 +51,7 @@ final class StatusCommand extends Command
                 'running' => '<info>running</info>',
                 'stopped' => '<comment>stopped</comment>',
                 'not running' => '<error>not running</error>',
+                'orphaned' => '<fg=red;options=bold>orphaned</>',
                 default => '<fg=gray>disabled</>',
             };
             $rows[] = [
