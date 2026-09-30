@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Loongs\Console\Command;
 
-use Composer\InstalledVersions;
 use Loongs\Console\Command;
 use Loongs\Console\Kernel;
 use Loongs\Process\ProcessLog;
@@ -102,10 +101,7 @@ TXT);
     {
         $config = $manager->config();
         $version = Kernel::frameworkVersion();
-        $appName = trim((string) $config->get('app.name', ''));
-        if ($appName === '') {
-            $appName = self::rootPackageName();
-        }
+        $appName = $manager->appName();
         $env = (string) $config->get('app.env', 'production');
         $debug = filter_var($config->get('app.debug', false), FILTER_VALIDATE_BOOLEAN);
 
@@ -118,6 +114,7 @@ TXT);
         $lines = [
             ['Framework', sprintf('%s %s <fg=gray>(loongs/framework)</>', Kernel::NAME, $e($version))],
             ['App', sprintf('<options=bold>%s</>  env=%s  debug=%s', $e($appName), $e($env), $debug ? '<comment>on</comment>' : 'off')],
+            ['Titles', $e($manager->titlePrefix() . ': master / <role>')],
             ['Runtime', sprintf('PHP %s  ·  Swoole %s', PHP_VERSION, $e((string) (phpversion('swoole') ?: 'not loaded')))],
             ['io_uring', $this->ioUringLine($iouring, $io->isVerbose())],
             ['Base path', $e($this->basePath())],
@@ -208,21 +205,6 @@ TXT);
         $base = $this->basePath() . '/';
 
         return str_starts_with($path, $base) ? substr($path, strlen($base)) : $path;
-    }
-
-    private static function rootPackageName(): string
-    {
-        try {
-            if (class_exists(InstalledVersions::class)) {
-                $name = (string) (InstalledVersions::getRootPackage()['name'] ?? '');
-                if ($name !== '' && $name !== '__root__') {
-                    return $name;
-                }
-            }
-        } catch (Throwable) {
-        }
-
-        return 'loongs';
     }
 
     /**

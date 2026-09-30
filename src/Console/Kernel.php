@@ -14,10 +14,14 @@ use Loongs\Console\Command\RpcSwitchCommand;
 use Loongs\Console\Command\StartCommand;
 use Loongs\Console\Command\StatusCommand;
 use Loongs\Console\Command\StopCommand;
+use Loongs\Process\InvalidAppNameException;
 use Loongs\Support\BasePath;
 use Loongs\Support\Env;
 use Symfony\Component\Console\Application as SymfonyApplication;
 use Symfony\Component\Console\Command\Command as SymfonyCommand;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Style\SymfonyStyle;
 use Throwable;
 
 /**
@@ -113,6 +117,18 @@ final class Kernel extends SymfonyApplication
         }
 
         return null;
+    }
+
+    /** Invalid APP_NAME → one clear error line + exit 1 (thrown before anything is forked / signalled). */
+    protected function doRunCommand(SymfonyCommand $command, InputInterface $input, OutputInterface $output): int
+    {
+        try {
+            return parent::doRunCommand($command, $input, $output);
+        } catch (InvalidAppNameException $e) {
+            (new SymfonyStyle($input, $output))->error($e->getMessage());
+
+            return SymfonyCommand::FAILURE;
+        }
     }
 
     private function addLoongsCommand(SymfonyCommand $command): void

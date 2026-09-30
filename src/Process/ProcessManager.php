@@ -27,6 +27,12 @@ final class ProcessManager
 {
     private const TITLE_PREFIX = 'loong-swoole';
 
+    /** APP_NAME rule (it is part of every process title and of the default pid / lock / log names). */
+    public const APP_NAME_PATTERN = '/^[A-Za-z0-9_]+\z/';
+
+    /** APP_NAME when unset or empty. */
+    public const DEFAULT_APP_NAME = 'loongs';
+
     /** Graceful stop budget for children before the master SIGKILLs the whole tree. */
     private const STOP_GRACE = 15.0;
 
@@ -83,6 +89,11 @@ final class ProcessManager
     /** Self-heal could not re-lock a replaced lock file (someone else holds it); logged once. */
     private bool $healConflictLogged = false;
 
+    private string $appName = self::DEFAULT_APP_NAME;
+
+    /** "loong-swoole[<APP_NAME>]" — every process title of this service starts with it + ": ". */
+    private string $titlePrefix = self::TITLE_PREFIX . '[' . self::DEFAULT_APP_NAME . ']';
+
     /** @param list<string>|null $only */
     public function __construct(string $basePath, ?array $only = null)
     {
@@ -94,6 +105,9 @@ final class ProcessManager
         )));
 
         Env::load($this->basePath . '/.env');
+        // Validate before anything else (no config / fork): throws InvalidAppNameException.
+        $this->appName = self::resolveAppName(Env::get('APP_NAME'));
+        $this->titlePrefix = self::TITLE_PREFIX . '[' . $this->appName . ']';
         $this->config = new Repository($this->basePath . '/config');
 
         /** @var array<string, mixed> $process */
@@ -108,6 +122,36 @@ final class ProcessManager
         $discovery = new AppProcessDiscovery($this->basePath . '/apps');
         $appProcesses = $discovery->discover();
         $this->masterOptions['processes'] = AppProcessDiscovery::merge($globalProcesses, $appProcesses);
+    }
+
+    /**
+     * Validated APP_NAME: null / "" → DEFAULT_APP_NAME, otherwise it must match APP_NAME_PATTERN.
+     *
+     * @throws InvalidAppNameException
+     */
+    public static function resolveAppName(mixed $raw): string
+    {
+        if ($raw === null || $raw === false || $raw === '') {
+            return self::DEFAULT_APP_NAME;
+        }
+        $name = is_scalar($raw) ? (string) $raw : get_debug_type($raw);
+        if (preg_match(self::APP_NAME_PATTERN, $name) !== 1) {
+            throw new InvalidAppNameException($name);
+        }
+
+        return $name;
+    }
+
+    /** APP_NAME of this service (validated; "loongs" when unset). */
+    public function appName(): string
+    {
+        return $this->appName;
+    }
+
+    /** Process title prefix of this service: "loong-swoole[<APP_NAME>]". */
+    public function titlePrefix(): string
+    {
+        return $this->titlePrefix;
     }
 
     /**
@@ -347,7 +391,7 @@ final class ProcessManager
             return $pid;
         }
         // Fallback when the pid file is missing / wrong or the lock file was deleted / replaced:
-        // the process titled "loong-swoole: master" that has THIS instance's lock path open (the
+        // the process titled "loong-swoole[<APP_NAME>]: master" that has THIS instance's lock path open (the
         // current file or the unlinked inode, "<path> (deleted)"). The lock path is per instance
         // (derived from the pid file), so other instances on the host never match.
         foreach ($holders as $h) {
@@ -388,7 +432,10 @@ final class ProcessManager
 
     public function logFile(): string
     {
-        $rel = (string) ($this->masterOptions['log_file'] ?? 'runtime/loong-swoole.log');
+        $rel = (string) ($this->masterOptions['log_file'] ?? '');
+        if ($rel === '') {
+            $rel = 'runtime/' . $this->appName . '.log';
+        }
         if ($rel !== '' && ($rel[0] === '/' || (strlen($rel) > 2 && $rel[1] === ':'))) {
             return $rel;
         }
@@ -417,7 +464,7 @@ final class ProcessManager
             $childPids = $this->childPidsByName($masterPid);
         } else {
             foreach ($orphans as $o) {
-                if (preg_match('/^' . preg_quote(self::TITLE_PREFIX, '/') . ': ([^\s#]+)/', $o['title'], $mm) === 1 && $mm[1] !== 'watchdog') {
+                if (preg_match('/^' . preg_quote($this->titlePrefix, '/') . ': ([^\s#]+)/', $o['title'], $mm) === 1 && $mm[1] !== 'watchdog') {
                     $childPids[$mm[1]][] = $o['pid'];
                 }
             }
@@ -460,6 +507,8 @@ final class ProcessManager
         }
 
         return [
+            'app_name' => $this->appName,
+            'title_prefix' => $this->titlePrefix,
             'running' => $masterPid !== null,
             'master_pid' => $masterPid,
             'orphans' => $orphans,
@@ -473,7 +522,7 @@ final class ProcessManager
 
     /**
      * Direct children of the master, keyed by process name (from the child title
-     * "loong-swoole: <name>[#i]" set in runChild()). Linux /proc only; empty elsewhere.
+     * "loong-swoole[<APP_NAME>]: <name>[#i]" set in runChild()). Linux /proc only; empty elsewhere.
      *
      * @return array<string, list<int>>
      */
@@ -491,7 +540,7 @@ final class ProcessManager
             }
             $pid = (int) basename(dirname($statFile));
             $cmd = trim(str_replace("\0", ' ', (string) @file_get_contents('/proc/' . $pid . '/cmdline')));
-            if (preg_match('/' . preg_quote(self::TITLE_PREFIX, '/') . ': ([^\s#]+)/', $cmd, $m) === 1) {
+            if (preg_match('/^' . preg_quote($this->titlePrefix, '/') . ': ([^\s#]+)/', $cmd, $m) === 1) {
                 $out[$m[1]][] = $pid;
             }
         }
@@ -979,7 +1028,7 @@ final class ProcessManager
 
     private function setTitle(string $suffix): void
     {
-        $title = self::TITLE_PREFIX . ': ' . $suffix;
+        $title = $this->titlePrefix . ': ' . $suffix;
         if (function_exists('cli_set_process_title')) {
             @cli_set_process_title($title);
         }
@@ -990,7 +1039,10 @@ final class ProcessManager
 
     private function pidFilePath(): string
     {
-        $rel = (string) ($this->masterOptions['pid_file'] ?? 'runtime/loong-swoole.pid');
+        $rel = (string) ($this->masterOptions['pid_file'] ?? '');
+        if ($rel === '') {
+            $rel = 'runtime/' . $this->appName . '.pid';
+        }
         if ($rel[0] === '/' || (strlen($rel) > 2 && $rel[1] === ':')) {
             return $rel;
         }
@@ -1115,11 +1167,11 @@ final class ProcessManager
 
     private function isMasterProcess(int $pid): bool
     {
-        return $this->processTitle($pid) === self::TITLE_PREFIX . ': master';
+        return $this->processTitle($pid) === $this->titlePrefix . ': master';
     }
 
     /**
-     * Lock holders titled "loong-swoole: …" — this instance's processes, excluding transient CLI
+     * Lock holders titled "loong-swoole[<APP_NAME>]: …" — this instance's processes, excluding transient CLI
      * probes (status/start) that merely opened the file.
      *
      * @return list<int>
@@ -1128,7 +1180,7 @@ final class ProcessManager
     {
         return array_values(array_filter(
             $this->lockHolders() ?? [],
-            fn (int $p): bool => str_starts_with($this->processTitle($p), self::TITLE_PREFIX . ':'),
+            fn (int $p): bool => str_starts_with($this->processTitle($p), $this->titlePrefix . ':'),
         ));
     }
 
@@ -1511,7 +1563,9 @@ final class ProcessManager
                 continue;
             }
             $owners = $this->describe($this->portOwners($port));
-            $ours = array_filter($owners, static fn (array $o): bool => str_starts_with($o['title'], self::TITLE_PREFIX . ':'));
+            $prefix = $this->titlePrefix . ':';
+            $ours = array_filter($owners, static fn (array $o): bool => str_starts_with($o['title'], $prefix));
+            $otherService = array_filter($owners, static fn (array $o): bool => !str_starts_with($o['title'], $prefix) && str_starts_with($o['title'], self::TITLE_PREFIX));
             throw new \RuntimeException(sprintf(
                 'Port %s:%d for [%s] is already in use%s (%s).%s',
                 $host,
@@ -1519,9 +1573,11 @@ final class ProcessManager
                 $name,
                 $owners === [] ? '' : ' by ' . implode(', ', array_map(static fn (array $o): string => sprintf('pid %d %s', $o['pid'], $o['title']), array_slice($owners, 0, 5))),
                 $error,
-                $ours !== []
-                    ? ' Leftover loong-swoole processes: run ./loongs stop (or stop the instance that owns them).'
-                    : ' Free the port or change it in .env / config/process.php.',
+                match (true) {
+                    $ours !== [] => ' Leftover loong-swoole processes: run ./loongs stop (or stop the instance that owns them).',
+                    $otherService !== [] => ' It belongs to another loongs service (other APP_NAME): stop that service or change the port in .env / config/process.php.',
+                    default => ' Free the port or change it in .env / config/process.php.',
+                },
             ));
         }
     }

@@ -25,6 +25,7 @@ final class StatusCommand extends Command
         $r = $manager->statusReport();
 
         $io->title('Loongs status');
+        $io->writeln(sprintf('  app: <options=bold>%s</>  <fg=gray>(process titles %s: …)</>', $r['app_name'], $r['title_prefix']));
         if ($r['running']) {
             $io->writeln(sprintf('  master: <info>running</info>  pid=<comment>%d</comment>', $r['master_pid']));
             foreach ($r['notes'] ?? [] as $note) {

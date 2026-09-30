@@ -11,7 +11,7 @@ use RuntimeException;
  * Discovers apps/{Name}/config/processes.php and returns a prefixed process map.
  *
  * Key "queue" in apps/User/config/processes.php becomes "user.queue".
- * Process title uses the prefixed name: loong-swoole: user.queue.
+ * Process title uses the prefixed name: loong-swoole[<APP_NAME>]: user.queue.
  *
  * Custom class / crontab handlers must live under App\{Name}\ (fail fast).
  * Injects '_app' => directory name into each entry for role filtering.
