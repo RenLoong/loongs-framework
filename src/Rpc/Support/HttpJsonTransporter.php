@@ -147,19 +147,24 @@ final class HttpJsonTransporter
     private static function borrowClient(string $host, int $port, bool $ssl, int $timeoutMs): CoroutineHttpClient
     {
         $key = self::poolKey($host, $port, $ssl);
+        // http_compression defaults to true and injects Accept-Encoding; Swoole then
+        // warns ERRNO 7105 and ignores Content-Length on JSON POST bodies.
+        $opts = [
+            'timeout' => max(0.001, $timeoutMs / 1000),
+            'keep_alive' => true,
+            'http_compression' => false,
+        ];
+
         if (!empty(self::$pool[$key])) {
             /** @var CoroutineHttpClient $client */
             $client = array_pop(self::$pool[$key]);
-            $client->set(['timeout' => max(0.001, $timeoutMs / 1000)]);
+            $client->set($opts);
 
             return $client;
         }
 
         $client = new CoroutineHttpClient($host, $port, $ssl);
-        $client->set([
-            'timeout' => max(0.001, $timeoutMs / 1000),
-            'keep_alive' => true,
-        ]);
+        $client->set($opts);
 
         return $client;
     }
