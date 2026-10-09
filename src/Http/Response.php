@@ -80,7 +80,8 @@ final class Response
         $response = new self();
         $response->status = $status;
         $response->headers['Content-Type'] = ServeAppPublicMiddleware::mimeFor($path);
-        $response->headers['Content-Length'] = (string) strlen($bytes);
+        // Do not set Content-Length: Swoole HTTP compression ignores it when the
+        // request has Accept-Encoding (ERRNO 7105) and computes length itself.
         $response->content = $bytes;
 
         return $response;
@@ -106,6 +107,11 @@ final class Response
     {
         $swoole->status($this->status);
         foreach ($this->headers as $name => $value) {
+            // Swoole warns ERRNO 7105 and drops Content-Length when the client
+            // sent Accept-Encoding and response compression is on.
+            if (strcasecmp($name, 'Content-Length') === 0) {
+                continue;
+            }
             $swoole->header($name, $value);
         }
         $swoole->end($this->content);
