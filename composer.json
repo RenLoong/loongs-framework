@@ -23,5 +23,14 @@
         ]
     },
     "minimum-stability": "stable",
-    "prefer-stable": true
+    "prefer-stable": true,
+    "scripts": {
+        "publish-config": "@php bin/publish-config.php",
+        "post-install-cmd": [
+            "@publish-config"
+        ],
+        "post-update-cmd": [
+            "@publish-config"
+        ]
+    }
 }
