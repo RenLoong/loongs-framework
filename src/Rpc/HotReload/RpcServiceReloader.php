@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Loongs\Rpc\HotReload;
 
+use Loongs\App\AppRpcServices;
 use Loongs\Process\ProcessLog;
 use Loongs\Config\Repository;
 use Loongs\Rpc\Discovery\ConfigServiceDiscovery;
@@ -16,6 +17,8 @@ use Throwable;
  *
  * Sources (effective = config ⊕ overrides, override entry replaces the whole service):
  *   1. config/rpc.php  → 'services'   (re-included fresh; opcache invalidated first)
+ *      merged with apps/<Name>/config/rpc.php or auto from apps/<Name>/rpc.php
+ *      (root wins on key conflict; see AppRpcServices)
  *   2. runtime override JSON          (rpc.hot_reload.override_file, written by `loongs rpc:*`)
  *
  * Every worker owns one reloader bound to its own ConfigServiceDiscovery. A Swoole timer
@@ -61,6 +64,7 @@ final class RpcServiceReloader
     public function __construct(
         private readonly ConfigServiceDiscovery $discovery,
         private readonly string $configFile,
+        private readonly string $appsPath,
         private readonly RpcServiceOverrides $overrides,
         private readonly bool $enabled = true,
         private readonly int $intervalMs = 1000,
@@ -84,9 +88,11 @@ final class RpcServiceReloader
         $enabled = filter_var($hot['enabled'] ?? true, FILTER_VALIDATE_BOOLEAN);
         $interval = (int) ($hot['interval_ms'] ?? 1000);
 
+        $base = rtrim($basePath, '/\\');
         return new self(
             discovery: $discovery,
-            configFile: rtrim($basePath, '/\\') . '/config/rpc.php',
+            configFile: $base . '/config/rpc.php',
+            appsPath: $base . '/apps',
             overrides: new RpcServiceOverrides(self::resolvePath($basePath, (string) ($hot['override_file'] ?? 'runtime/rpc_services.json'))),
             enabled: $enabled,
             intervalMs: max(50, $interval),
@@ -156,6 +162,11 @@ final class RpcServiceReloader
         return $this->configFile;
     }
 
+    public function appsPath(): string
+    {
+        return $this->appsPath;
+    }
+
     public function discovery(): ConfigServiceDiscovery
     {
         return $this->discovery;
@@ -168,35 +179,40 @@ final class RpcServiceReloader
     }
 
     /**
-     * services from config/rpc.php, re-included from disk (opcache invalidated).
+     * Effective baseline services: apps auto-scan merged with config/rpc.php (root wins).
+     * Re-included from disk (opcache invalidated). Used by hot-reload and rpc:show.
      *
      * @return array<array-key, mixed>
      */
     public function configServices(): array
     {
         clearstatcache(true, $this->configFile);
-        if (!is_file($this->configFile)) {
-            return [];
-        }
-        if (function_exists('opcache_invalidate')) {
-            @opcache_invalidate($this->configFile, true);
+        $rootServices = [];
+        if (is_file($this->configFile)) {
+            if (function_exists('opcache_invalidate')) {
+                @opcache_invalidate($this->configFile, true);
+            }
+
+            $file = $this->configFile;
+            /** @var mixed $value */
+            $value = (static function () use ($file): mixed {
+                return require $file;
+            })();
+
+            if (!is_array($value)) {
+                throw RpcException::badRequest("{$file} must return an array.");
+            }
+            $services = $value['services'] ?? [];
+            if (!is_array($services)) {
+                throw RpcException::badRequest("{$file}: 'services' must be an array.");
+            }
+            $rootServices = $services;
         }
 
-        $file = $this->configFile;
-        /** @var mixed $value */
-        $value = (static function () use ($file): mixed {
-            return require $file;
-        })();
-
-        if (!is_array($value)) {
-            throw RpcException::badRequest("{$file} must return an array.");
-        }
-        $services = $value['services'] ?? [];
-        if (!is_array($services)) {
-            throw RpcException::badRequest("{$file}: 'services' must be an array.");
-        }
-
-        return $services;
+        return AppRpcServices::merge(
+            AppRpcServices::discover($this->appsPath),
+            $rootServices,
+        );
     }
 
     /**
@@ -224,7 +240,9 @@ final class RpcServiceReloader
         clearstatcache(true, $this->configFile);
         $cfg = is_file($this->configFile) ? (string) @file_get_contents($this->configFile) : '';
 
-        return hash('sha256', $cfg) . ':' . $this->overrides->fingerprint();
+        return hash('sha256', $cfg)
+            . ':' . AppRpcServices::fingerprint($this->appsPath)
+            . ':' . $this->overrides->fingerprint();
     }
 
     /**

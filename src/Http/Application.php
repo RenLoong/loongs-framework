@@ -7,6 +7,7 @@ namespace Loongs\Http;
 use Loongs\Process\ProcessLog;
 use Loongs\App\AppConfig;
 use Loongs\App\AppDiscovery;
+use Loongs\App\AppRpcServices;
 use Loongs\App\AppMiddlewareResolver;
 use Loongs\Config\Repository;
 use Loongs\Redis\RedisManager;
@@ -188,11 +189,16 @@ final class Application
         $handlerRegistry = new HandlerRegistry();
         $this->container->instance(HandlerRegistry::class, $handlerRegistry);
 
-        /** @var array<string, array<string, mixed>> $services */
-        $services = $this->config->get('rpc.services', []);
-        if (!is_array($services)) {
-            $services = [];
+        /** @var array<array-key, mixed> $rootServices */
+        $rootServices = $this->config->get('rpc.services', []);
+        if (!is_array($rootServices)) {
+            $rootServices = [];
         }
+        // apps/<Name>/rpc.php + apps/<Name>/config/rpc.php → client services; root config wins on conflict.
+        $services = AppRpcServices::merge(
+            AppRpcServices::discover($this->basePath . '/apps'),
+            $rootServices,
+        );
 
         $discovery = new ConfigServiceDiscovery($services);
         $this->container->instance(ConfigServiceDiscovery::class, $discovery);
