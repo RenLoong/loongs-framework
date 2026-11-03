@@ -7,6 +7,7 @@ namespace Loongs\Http;
 use Loongs\Process\ProcessLog;
 use Loongs\App\AppConfig;
 use Loongs\App\AppDiscovery;
+use Loongs\Service\ServiceBoot;
 use Loongs\App\AppRpcServices;
 use Loongs\App\AppMiddlewareResolver;
 use Loongs\Config\Repository;
@@ -174,6 +175,9 @@ final class Application
         /** @var HandlerRegistry $handlerRegistry */
         $handlerRegistry = $this->container->make(HandlerRegistry::class);
         $discovery->registerRpcHandlers($handlerRegistry, $app, $container, $this->onlyApp);
+
+        // Main/sub service strategy: apps with loongs.json services[] role=sub register via RPC.
+        ServiceBoot::registerSubs($container, $this->basePath . '/apps');
     }
 
     private function bootRpc(): void
